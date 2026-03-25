@@ -80,10 +80,21 @@ def cmd_list(args):
         print("No messages.")
         return
 
+    max_width = 70
+    current_date = None
+
     for ts, body, captured_at in rows:
         dt = datetime.fromtimestamp(ts / 1000)
+        date_str = dt.strftime("%b %d")
+
+        if date_str != current_date:
+            current_date = date_str
+            print(f"  {date_str}")
+
         oneline = body.replace("\n", " ↩ ")
-        print(f"  {dt.strftime('%b %d %H:%M')}  {oneline}")
+        if len(oneline) > max_width:
+            oneline = oneline[:max_width - 1] + "…"
+        print(f"    {dt.strftime('%H:%M')}  {oneline}")
 
 
 def cmd_daemon(args):
