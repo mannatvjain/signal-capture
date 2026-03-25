@@ -85,6 +85,12 @@ def cmd_list(args):
         print(f"  {dt.strftime('%b %d %H:%M')}  {body}")
 
 
+def cmd_daemon(args):
+    """Run persistent capture daemon."""
+    from signal_capture.daemon import run_daemon
+    run_daemon()
+
+
 def cmd_count(args):
     """Print message count."""
     if not DB_PATH.exists():
@@ -105,6 +111,7 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("poll", help="Pull new messages from Signal into the database")
+    sub.add_parser("daemon", help="Run persistent capture daemon (instant delivery)")
     sub.add_parser("view", help="Open the TUI message viewer")
     sub.add_parser("health", help="Check pipeline health")
 
@@ -117,6 +124,7 @@ def main():
 
     commands = {
         "poll": cmd_poll,
+        "daemon": cmd_daemon,
         "view": cmd_view,
         "health": cmd_health,
         "list": cmd_list,
