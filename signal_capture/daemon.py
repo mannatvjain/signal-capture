@@ -17,6 +17,7 @@ from signal_capture.capture import (
     ACCOUNT, DB_PATH, HEALTH_FILE, SIGNAL_CLI,
     init_db, insert_messages,
 )
+from signal_capture.cards import process_card
 
 SOCKET_PATH = Path.home() / ".signal-capture.socket"
 
@@ -107,6 +108,7 @@ def run_daemon():
                 if inserted:
                     ts = datetime.fromtimestamp(entry["signal_timestamp"] / 1000)
                     print(f"[{ts.strftime('%H:%M')}] {entry['body'][:80]}", flush=True)
+                    process_card(entry["body"], entry["signal_timestamp"])
                     send_confirmation_via_socket(inserted)
 
             # Update health on every message cycle
