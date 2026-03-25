@@ -1,0 +1,2 @@
+[console_scripts]
+sl = signal_capture.cli:main

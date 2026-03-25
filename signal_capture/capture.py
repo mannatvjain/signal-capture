@@ -23,7 +23,7 @@ DB_PATH = DB_DIR / "capture.db"
 HEALTH_FILE = Path.home() / ".signal-capture-health"
 SIGNAL_CLI = "/opt/homebrew/bin/signal-cli"
 
-CONFIG_FILE = Path(__file__).parent / ".env"
+CONFIG_FILE = Path(__file__).parent.parent / ".env"
 ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "")
 
 if not ACCOUNT and CONFIG_FILE.exists():
@@ -74,10 +74,14 @@ def extract_self_messages(messages: list[dict]) -> list[dict]:
     for msg in messages:
         envelope = msg.get("envelope", {})
         source = envelope.get("source") or envelope.get("sourceNumber", "")
-        data = envelope.get("dataMessage", {})
-        body = data.get("message")
 
-        if source == ACCOUNT and body:
+        # Note to Self arrives as a syncMessage.sentMessage to yourself
+        sync = envelope.get("syncMessage", {})
+        sent = sync.get("sentMessage", {})
+        dest = sent.get("destination") or sent.get("destinationNumber", "")
+        body = sent.get("message")
+
+        if source == ACCOUNT and dest == ACCOUNT and body:
             timestamp_ms = envelope.get("timestamp", 0)
             captured.append({"body": body, "signal_timestamp": timestamp_ms})
 
