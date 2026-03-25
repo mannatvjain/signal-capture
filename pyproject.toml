@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signal-capture"
+version = "0.1.0"
+description = "Signal capture pipeline"
+requires-python = ">=3.8"
+dependencies = ["textual>=1.0"]
+
+[project.scripts]
+sl = "signal_capture.cli:main"
