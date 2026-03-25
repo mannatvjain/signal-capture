@@ -172,8 +172,10 @@ class SignalViewer(App):
         for row in rows:
             _id, signal_ts, body, captured_at = row
             time_str = relative_time(captured_at)
-            # Truncate long messages for table display
-            display_body = body if len(body) <= 120 else body[:117] + "..."
+            # Collapse newlines and truncate for table display
+            display_body = body.replace("\n", " ↩ ")
+            if len(display_body) > 120:
+                display_body = display_body[:117] + "..."
             table.add_row(time_str, display_body, key=str(_id))
 
         count = len(rows)

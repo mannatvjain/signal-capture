@@ -82,7 +82,8 @@ def cmd_list(args):
 
     for ts, body, captured_at in rows:
         dt = datetime.fromtimestamp(ts / 1000)
-        print(f"  {dt.strftime('%b %d %H:%M')}  {body}")
+        oneline = body.replace("\n", " ↩ ")
+        print(f"  {dt.strftime('%b %d %H:%M')}  {oneline}")
 
 
 def cmd_daemon(args):
