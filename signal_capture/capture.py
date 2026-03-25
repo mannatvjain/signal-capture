@@ -25,11 +25,35 @@ SIGNAL_CLI = "/opt/homebrew/bin/signal-cli"
 
 CONFIG_FILE = Path(__file__).parent.parent / ".env"
 ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "")
+ALERT_ACCOUNT = os.environ.get("SIGNAL_ALERT_ACCOUNT", "")
+ALERT_RECIPIENT = os.environ.get("SIGNAL_ALERT_RECIPIENT", "")
 
-if not ACCOUNT and CONFIG_FILE.exists():
+if CONFIG_FILE.exists():
     for line in CONFIG_FILE.read_text().splitlines():
-        if line.startswith("SIGNAL_ACCOUNT="):
-            ACCOUNT = line.split("=", 1)[1].strip().strip("'\"")
+        key, _, val = line.partition("=")
+        val = val.strip().strip("'\"")
+        if key == "SIGNAL_ACCOUNT" and not ACCOUNT:
+            ACCOUNT = val
+        elif key == "SIGNAL_ALERT_ACCOUNT" and not ALERT_ACCOUNT:
+            ALERT_ACCOUNT = val
+        elif key == "SIGNAL_ALERT_RECIPIENT" and not ALERT_RECIPIENT:
+            ALERT_RECIPIENT = val
+
+
+def send_alert(text: str) -> bool:
+    """Send a push notification via the GV bot account. Returns True on success."""
+    if not ALERT_ACCOUNT or not ALERT_RECIPIENT:
+        print("Alert account not configured.", file=sys.stderr)
+        return False
+    try:
+        result = subprocess.run(
+            [SIGNAL_CLI, "-a", ALERT_ACCOUNT, "send", "-m", text, ALERT_RECIPIENT],
+            capture_output=True, text=True, timeout=15,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"Alert send failed: {e}", file=sys.stderr)
+        return False
 
 
 def init_db() -> sqlite3.Connection:
