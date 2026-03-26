@@ -6,17 +6,20 @@ to the appropriate vault location.
 """
 
 import json
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
+from signal_capture.capture import DB_PATH
 from signal_capture.cards import get_daily_note_path, ensure_daily_note
 
 VAULT_ROOT = Path.home() / "Documents" / "Obsidian Vaults" / "dot"
 SUNDRY = VAULT_ROOT / "4-Sundry"
 
 TARGETS = {
+    "reminder": None,  # reminders table in capture.db
     "resource": None,  # daily note ## Links
     "todo": None,      # daily note ### Todo
     "good-advice": SUNDRY / "A list of good advice.md",
@@ -25,23 +28,30 @@ TARGETS = {
     "sundry": SUNDRY / "Running Sundry.md",
 }
 
-CLASSIFY_PROMPT = """\
+CLASSIFY_PROMPT_TEMPLATE = """\
 You are a message classifier. Given a captured message, classify it into exactly one category and return JSON.
 
+Current time: {current_time}
+
 Categories:
+- "reminder": Time-bound reminders — messages that reference a specific time to be reminded about something (e.g. "speak with colin about mechinterp at 1pm tomorrow", "remind me to call mom at 5", "gym at 3pm"). The key signal is a specific time/date to fire the reminder.
 - "resource": Links, articles, papers, videos, things to look at or read
-- "todo": Near-term actionable items with time pressure (e.g. "talk with Colin about X tomorrow", "email Prof Fusi Thursday"). NOT vague aspirations like "read more books" or "explore X someday"
+- "todo": Near-term actionable items with time pressure but NO specific reminder time (e.g. "email Prof Fusi this week"). NOT vague aspirations like "read more books" or "explore X someday"
 - "good-advice": Wisdom, life advice, principles to remember
 - "founders": Specifically about David Senra's Founders Podcast (episodes, quotes, takeaways)
 - "deltas": Changes, updates, observations about how things are going or shifting
 - "sundry": Everything else — random thoughts, observations, ideas that don't fit above
 
-For "todo" messages, also provide a cleaned-up version:
-- One concise action line
-- Optional brief context line (only if the original message has important detail that would be lost)
+For "reminder" messages:
+- "cleaned": A short description of what to be reminded about
+- "fire_at": The absolute ISO 8601 datetime with timezone offset (e.g. "2026-03-26T13:00:00-04:00"). Resolve relative references ("tomorrow", "thursday", "in 2 hours") using the current time above. Timezone is America/New_York (UTC-4 during EDT, UTC-5 during EST).
+
+For "todo" messages:
+- "cleaned": One concise action line
+- "context": Optional brief context line (only if important detail would be lost)
 
 Return ONLY valid JSON in this format:
-{"category": "<category>", "cleaned": "<for todos: one-liner action>", "context": "<for todos: optional extra context or null>", "original": "<original message>"}
+{{"category": "<category>", "cleaned": "<description>", "context": "<for todos: optional or null>", "fire_at": "<for reminders: ISO 8601 or null>", "original": "<original message>"}}
 
 Message:
 """
@@ -52,10 +62,11 @@ CLASSIFICATION_SCHEMA = json.dumps({
     "properties": {
         "category": {
             "type": "string",
-            "enum": ["resource", "todo", "good-advice", "founders", "deltas", "sundry"],
+            "enum": ["reminder", "resource", "todo", "good-advice", "founders", "deltas", "sundry"],
         },
         "cleaned": {"type": ["string", "null"]},
         "context": {"type": ["string", "null"]},
+        "fire_at": {"type": ["string", "null"]},
         "original": {"type": "string"},
     },
     "required": ["category", "original"],
@@ -64,7 +75,8 @@ CLASSIFICATION_SCHEMA = json.dumps({
 
 def classify_message(body: str) -> dict | None:
     """Call claude -p to classify a message. Returns parsed JSON or None."""
-    prompt = CLASSIFY_PROMPT + body.strip()
+    now = datetime.now().astimezone()
+    prompt = CLASSIFY_PROMPT_TEMPLATE.format(current_time=now.isoformat()) + body.strip()
 
     try:
         result = subprocess.run(
@@ -171,9 +183,56 @@ def route_todo(classification: dict, dt: datetime) -> None:
         path.write_text(content)
 
 
-def _route_to_category(body: str, category: str, dt: datetime, classification: dict | None = None) -> None:
+def route_reminder(body: str, fire_at: str, signal_timestamp: int) -> bool:
+    """Insert a reminder into the reminders table. Returns True on success."""
+    try:
+        # Validate fire_at is a valid ISO 8601 datetime
+        datetime.fromisoformat(fire_at)
+    except (ValueError, TypeError):
+        print(f"Invalid fire_at: {fire_at}", flush=True)
+        return False
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute(
+            "INSERT INTO reminders (body, fire_at, signal_timestamp, created_at) VALUES (?, ?, ?, ?)",
+            (body.strip(), fire_at, signal_timestamp, datetime.now().isoformat()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        print(f"Reminder insert failed: {e}", flush=True)
+        return False
+    finally:
+        conn.close()
+
+
+def remove_reminder(body: str) -> bool:
+    """Remove a reminder by body text match. Returns True if found and removed."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        cursor = conn.execute(
+            "DELETE FROM reminders WHERE body = ? AND fired = 0", (body.strip(),)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _route_to_category(body: str, category: str, dt: datetime, classification: dict | None = None, signal_timestamp: int = 0) -> None:
     """Route a message body to a specific category."""
-    if category == "resource":
+    if category == "reminder":
+        fire_at = (classification or {}).get("fire_at")
+        cleaned = (classification or {}).get("cleaned", body)
+        if fire_at:
+            route_reminder(cleaned, fire_at, signal_timestamp)
+        else:
+            # No fire_at — re-classify needed, fall through to todo
+            print("Reminder without fire_at, routing as todo", flush=True)
+            cls = {"cleaned": cleaned, "context": None, "original": body}
+            route_todo(cls, dt)
+    elif category == "resource":
         route_resource(body, dt)
     elif category == "todo":
         cls = classification or {"cleaned": body, "context": None, "original": body}
@@ -193,6 +252,9 @@ def _route_to_category(body: str, category: str, dt: datetime, classification: d
 
 def _remove_from_category(body: str, category: str, dt: datetime) -> bool:
     """Remove a message from its current category location. Returns True if found and removed."""
+    if category == "reminder":
+        return remove_reminder(body)
+
     body_stripped = body.strip()
 
     if category in ("resource", "todo"):
@@ -260,10 +322,21 @@ def route_message(body: str, signal_timestamp: int) -> str | None:
     category = classification.get("category", "sundry")
     dt = datetime.fromtimestamp(signal_timestamp / 1000)
 
-    _route_to_category(body, category, dt, classification)
-    print(f"Routed to {category}", flush=True)
+    _route_to_category(body, category, dt, classification, signal_timestamp)
 
-    return category
+    if category == "reminder":
+        fire_at = classification.get("fire_at", "")
+        try:
+            fire_dt = datetime.fromisoformat(fire_at)
+            time_str = fire_dt.strftime("%-I:%M %p")
+            print(f"Routed to reminder @ {time_str}", flush=True)
+            return f"reminder @ {time_str}"
+        except (ValueError, TypeError):
+            print(f"Routed to reminder (no valid time)", flush=True)
+            return "reminder"
+    else:
+        print(f"Routed to {category}", flush=True)
+        return category
 
 
 def reroute_message(body: str, signal_timestamp: int, old_category: str, new_category: str) -> bool:
@@ -274,6 +347,15 @@ def reroute_message(body: str, signal_timestamp: int, old_category: str, new_cat
     if not removed:
         print(f"Warning: could not remove from {old_category}, routing to {new_category} anyway", flush=True)
 
-    # For todos routed via correction, use body as-is (no claude cleanup)
-    _route_to_category(body, new_category, dt)
+    if new_category == "reminder":
+        # Need to classify to extract fire_at
+        classification = classify_message(body)
+        if classification and classification.get("fire_at"):
+            _route_to_category(body, new_category, dt, classification, signal_timestamp)
+        else:
+            print("Reroute to reminder failed: could not extract time", flush=True)
+            return False
+    else:
+        # For other categories, use body as-is (no claude cleanup)
+        _route_to_category(body, new_category, dt, signal_timestamp=signal_timestamp)
     return True

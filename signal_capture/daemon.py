@@ -23,11 +23,11 @@ from signal_capture.triage import route_message, reroute_message
 
 SOCKET_PATH = Path.home() / ".signal-capture.socket"
 
-VALID_CATEGORIES = {"resource", "todo", "good-advice", "founders", "deltas", "sundry"}
+VALID_CATEGORIES = {"reminder", "resource", "todo", "good-advice", "founders", "deltas", "sundry"}
 
-# Match reply corrections like "todo", "founders", "good-advice"
+# Match reply corrections like "todo", "founders", "reminder"
 CORRECTION_PATTERN = re.compile(
-    r"^(resource|todo|good-advice|founders|deltas|sundry)$",
+    r"^(reminder|resource|todo|good-advice|founders|deltas|sundry)$",
     re.IGNORECASE,
 )
 
@@ -199,21 +199,25 @@ def run_daemon():
             if body.startswith("[vault]") or body.startswith("[sorted]") or body.startswith("[rerouted]") or body.startswith("[error]"):
                 continue
 
-            inserted = insert_messages(conn, [entry])
-            if inserted:
-                ts = datetime.fromtimestamp(entry["signal_timestamp"] / 1000)
-                print(f"[{ts.strftime('%H:%M')}] {body[:80]}", flush=True)
+            try:
+                inserted = insert_messages(conn, [entry])
+                if inserted:
+                    ts = datetime.fromtimestamp(entry["signal_timestamp"] / 1000)
+                    print(f"[{ts.strftime('%H:%M')}] {body[:80]}", flush=True)
 
-                # Confirmation 1: captured
-                send_message(f"[vault] captured.")
+                    # Confirmation 1: captured
+                    send_message(f"[vault] captured.")
 
-                if is_card(body):
-                    process_card(body, entry["signal_timestamp"])
-                    send_message(f"[sorted] card — {body}")
-                else:
-                    category = route_message(body, entry["signal_timestamp"])
-                    if category:
-                        send_message(f"[sorted] {category} — {body}")
+                    if is_card(body):
+                        process_card(body, entry["signal_timestamp"])
+                        send_message(f"[sorted] card — {body}")
+                    else:
+                        category = route_message(body, entry["signal_timestamp"])
+                        if category:
+                            send_message(f"[sorted] {category} — {body}")
+            except Exception as e:
+                print(f"Error processing message: {e}", flush=True)
+                send_message(f"[error] failed to process: {e}")
 
             HEALTH_FILE.write_text(datetime.now().isoformat())
 

@@ -68,6 +68,16 @@ def init_db() -> sqlite3.Connection:
             captured_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            body TEXT NOT NULL,
+            fire_at TEXT NOT NULL,
+            signal_timestamp INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            fired INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     conn.commit()
     return conn
 
