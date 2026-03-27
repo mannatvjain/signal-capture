@@ -19,7 +19,7 @@ from signal_capture.capture import (
     ACCOUNT, DB_PATH, HEALTH_FILE, SIGNAL_CLI,
     init_db, insert_messages,
 )
-from signal_capture.cards import process_card, is_card
+from signal_capture.cards import process_card, is_card, is_salience, process_salience
 from signal_capture.triage import (
     route_message, reroute_message,
     cancel_reminder_by_timestamp, reschedule_reminder_by_timestamp, parse_reschedule_time,
@@ -383,7 +383,10 @@ def run_daemon():
                     # Confirmation 1: captured
                     send_message(f"[vault] captured.")
 
-                    if is_card(body):
+                    if is_salience(body):
+                        process_salience(body, entry["signal_timestamp"])
+                        send_message(f"[sorted] salience — {body}")
+                    elif is_card(body):
                         process_card(body, entry["signal_timestamp"])
                         send_message(f"[sorted] card — {body}")
                     else:

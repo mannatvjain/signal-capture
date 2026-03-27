@@ -9,6 +9,7 @@ from pathlib import Path
 
 VAULT_ROOT = Path.home() / "Documents" / "Obsidian Vaults" / "dot"
 TEMPLATE_PATH = VAULT_ROOT / "CLAUDE" / "Templates" / "1 daily-template.md"
+SALIENCE_PATH = VAULT_ROOT / "CLAUDE" / "Running Salience.md"
 ANKI_SYNC_BIN = Path.home() / "bin" / "anki-sync"
 
 # Patterns to detect cards in messages
@@ -98,6 +99,28 @@ def trigger_anki_sync() -> None:
         )
     except FileNotFoundError:
         pass  # anki-sync not installed, skip silently
+
+
+def is_salience(body: str) -> bool:
+    """Check if a message is a salience prompt (prefixed with [salience])."""
+    return body.strip().lower().startswith("[salience]")
+
+
+def process_salience(body: str, signal_timestamp: int) -> bool:
+    """Strip [salience] prefix, format the card, and append to Running Salience. Returns True if processed."""
+    stripped = re.sub(r"^\[salience\]\s*", "", body.strip(), flags=re.IGNORECASE)
+    if not is_card(stripped):
+        return False
+
+    card_text = format_card(stripped)
+    content = SALIENCE_PATH.read_text() if SALIENCE_PATH.exists() else ""
+    content = content.rstrip() + "\n\n" + card_text + "\n"
+    SALIENCE_PATH.write_text(content)
+
+    print(f"Salience prompt appended to {SALIENCE_PATH.name}", flush=True)
+    trigger_anki_sync()
+    print("anki-sync triggered", flush=True)
+    return True
 
 
 def process_card(body: str, signal_timestamp: int) -> bool:
