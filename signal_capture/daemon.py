@@ -8,7 +8,6 @@ from stdout as they arrive, and inserts into SQLite instantly.
 
 import json
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -20,16 +19,13 @@ from signal_capture.capture import (
     init_db, insert_messages,
 )
 from signal_capture.cards import process_card, is_card, is_salience, process_salience
+from signal_capture.meals import IMAGE_CONTENT_TYPES, process_image_attachments
 from signal_capture.triage import (
     route_message, reroute_message,
     cancel_reminder_by_timestamp, reschedule_reminder_by_timestamp, parse_reschedule_time,
 )
 
 SOCKET_PATH = Path.home() / ".signal-capture.socket"
-SIGNAL_CLI_ATTACHMENTS = Path.home() / ".local" / "share" / "signal-cli" / "attachments"
-MEALS_DIR = Path.home() / "Documents" / "Obsidian Vaults" / "dot" / "CLAUDE" / "Running" / "Meals"
-
-IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/heic", "image/webp"}
 
 VALID_CATEGORIES = {"reminder", "resource", "todo", "good-advice", "founders", "deltas", "sundry"}
 
@@ -264,50 +260,6 @@ def handle_correction(entry: dict, conn) -> bool:
     return True
 
 
-def _ext_for_content_type(content_type: str) -> str:
-    """Map image content type to file extension."""
-    return {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/heic": ".heic",
-        "image/webp": ".webp",
-    }.get(content_type, ".jpg")
-
-
-def save_meal_photos(attachments: list[dict], timestamp_ms: int) -> list[Path]:
-    """Copy image attachments into the Meals folder. Returns list of saved paths."""
-    MEALS_DIR.mkdir(parents=True, exist_ok=True)
-    date_str = datetime.fromtimestamp(timestamp_ms / 1000).strftime("%Y-%m-%d")
-
-    # Find next index for this date
-    existing = sorted(MEALS_DIR.glob(f"{date_str}_*"))
-    next_idx = len(existing) + 1
-
-    saved = []
-    for att in attachments:
-        ct = att.get("contentType", "")
-        if ct not in IMAGE_CONTENT_TYPES:
-            continue
-
-        att_id = att.get("id")
-        if not att_id:
-            continue
-
-        src = SIGNAL_CLI_ATTACHMENTS / att_id
-        if not src.exists():
-            print(f"Attachment file not found: {src}", flush=True)
-            continue
-
-        ext = _ext_for_content_type(ct)
-        dest = MEALS_DIR / f"{date_str}_{next_idx}{ext}"
-        shutil.copy2(src, dest)
-        saved.append(dest)
-        next_idx += 1
-        print(f"Saved meal photo: {dest.name}", flush=True)
-
-    return saved
-
-
 def run_daemon():
     """Run signal-cli daemon and process messages as they stream in."""
     if not ACCOUNT:
@@ -355,19 +307,27 @@ def run_daemon():
 
             # Skip our own confirmation messages
             body = entry["body"]
-            if body.startswith(("[vault]", "[sorted]", "[rerouted]", "[cancelled]", "[rescheduled]", "[error]", "[meal]")):
+            if body.startswith(("[vault]", "[sorted]", "[rerouted]", "[cancelled]", "[rescheduled]", "[error]", "[meal]", "[photo]")):
                 continue
 
-            # Save meal photos if message has image attachments
-            meal_photos = []
+            # Process image attachments: classify meal vs non-meal, save, analyze
             if "attachments" in entry:
                 image_atts = [a for a in entry["attachments"]
                               if a.get("contentType", "") in IMAGE_CONTENT_TYPES]
                 if image_atts:
-                    meal_photos = save_meal_photos(image_atts, entry["signal_timestamp"])
-                    if meal_photos:
-                        names = ", ".join(p.name for p in meal_photos)
-                        send_message(f"[meal] {names}")
+                    saved, analyses = process_image_attachments(
+                        image_atts, entry["signal_timestamp"], body,
+                    )
+                    for path, analysis in zip(saved, analyses):
+                        if analysis:
+                            status = analysis.get("protocol_status", "?")
+                            cal = analysis.get("calories", 0)
+                            meal_type = analysis.get("meal_type", "meal")
+                            send_message(
+                                f"[meal] {path.name} — {meal_type} — {status} PROTOCOL ~{cal} kcal"
+                            )
+                        else:
+                            send_message(f"[photo] {path.name}")
 
             # Skip messages that are photo-only with no text
             if not body:
