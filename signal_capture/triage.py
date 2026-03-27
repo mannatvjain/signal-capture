@@ -220,6 +220,96 @@ def remove_reminder(body: str) -> bool:
         conn.close()
 
 
+def cancel_reminder_by_timestamp(signal_timestamp: int) -> str | None:
+    """Cancel an unfired reminder by signal_timestamp. Returns the body if found."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        row = conn.execute(
+            "SELECT body FROM reminders WHERE signal_timestamp = ? AND fired = 0 AND cancelled = 0",
+            (signal_timestamp,),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE reminders SET cancelled = 1 WHERE signal_timestamp = ? AND fired = 0",
+            (signal_timestamp,),
+        )
+        conn.commit()
+        return row[0]
+    finally:
+        conn.close()
+
+
+def reschedule_reminder_by_timestamp(signal_timestamp: int, new_fire_at: str) -> tuple[str | None, str | None]:
+    """Reschedule an unfired reminder. Returns (body, old_fire_at) or (None, None)."""
+    try:
+        datetime.fromisoformat(new_fire_at)
+    except (ValueError, TypeError):
+        return None, None
+
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        row = conn.execute(
+            "SELECT body, fire_at FROM reminders WHERE signal_timestamp = ? AND fired = 0 AND cancelled = 0",
+            (signal_timestamp,),
+        ).fetchone()
+        if not row:
+            return None, None
+        conn.execute(
+            "UPDATE reminders SET fire_at = ? WHERE signal_timestamp = ? AND fired = 0 AND cancelled = 0",
+            (new_fire_at, signal_timestamp),
+        )
+        conn.commit()
+        return row[0], row[1]
+    finally:
+        conn.close()
+
+
+def parse_reschedule_time(text: str, current_fire_at: str | None = None) -> str | None:
+    """Use Claude to parse a freeform time into ISO 8601. Returns fire_at or None."""
+    now = datetime.now().astimezone()
+    anchor_line = ""
+    if current_fire_at:
+        anchor_line = f"\nCurrently scheduled for: {current_fire_at}\nRelative adjustments like 'delay by 5 mins', '+2h', 'push back 30 min' should be relative to the CURRENT scheduled time, not the current time."
+
+    prompt = f"""Current time: {now.isoformat()}
+Timezone: America/New_York{anchor_line}
+
+The user wants to reschedule a reminder to: {text.strip()}
+
+Return the absolute ISO 8601 datetime with timezone offset (e.g. "2026-03-26T13:00:00-04:00").
+Resolve absolute references ("tomorrow", "thursday", "3pm") using the current time. Resolve relative adjustments ("delay by 5 mins", "+2h") using the current scheduled time if provided, otherwise the current time."""
+
+    schema = json.dumps({
+        "type": "object",
+        "properties": {
+            "fire_at": {"type": "string"},
+        },
+        "required": ["fire_at"],
+    })
+
+    try:
+        result = subprocess.run(
+            [
+                "/Users/mannatvjain/.local/bin/claude", "-p",
+                "--model", "haiku",
+                "--output-format", "json",
+                "--json-schema", schema,
+                "--system-prompt", "You are a time parser. Return only the requested JSON.",
+                "--allowedTools", "",
+            ],
+            input=prompt,
+            capture_output=True, text=True, timeout=30,
+        )
+        parsed = json.loads(result.stdout.strip())
+        fire_at = parsed.get("structured_output", parsed).get("fire_at")
+        # Validate
+        datetime.fromisoformat(fire_at)
+        return fire_at
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
 def _route_to_category(body: str, category: str, dt: datetime, classification: dict | None = None, signal_timestamp: int = 0) -> None:
     """Route a message body to a specific category."""
     if category == "reminder":

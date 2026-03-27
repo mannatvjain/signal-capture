@@ -75,9 +75,14 @@ def init_db() -> sqlite3.Connection:
             fire_at TEXT NOT NULL,
             signal_timestamp INTEGER NOT NULL,
             created_at TEXT NOT NULL,
-            fired INTEGER NOT NULL DEFAULT 0
+            fired INTEGER NOT NULL DEFAULT 0,
+            cancelled INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # Migration: add cancelled column if missing
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()}
+    if "cancelled" not in cols:
+        conn.execute("ALTER TABLE reminders ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -115,9 +120,13 @@ def extract_self_messages(messages: list[dict]) -> list[dict]:
         dest = sent.get("destination") or sent.get("destinationNumber", "")
         body = sent.get("message")
 
-        if source == ACCOUNT and dest == ACCOUNT and body:
+        if source == ACCOUNT and dest == ACCOUNT and (body or sent.get("attachments")):
             timestamp_ms = envelope.get("timestamp", 0)
-            captured.append({"body": body, "signal_timestamp": timestamp_ms})
+            entry = {"body": body or "", "signal_timestamp": timestamp_ms}
+            attachments = sent.get("attachments", [])
+            if attachments:
+                entry["attachments"] = attachments
+            captured.append(entry)
 
     return captured
 
