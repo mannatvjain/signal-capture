@@ -310,39 +310,40 @@ def run_daemon():
             if body.startswith(("[vault]", "[sorted]", "[rerouted]", "[cancelled]", "[rescheduled]", "[error]", "[meal]", "[photo]")):
                 continue
 
-            # Process image attachments: classify meal vs non-meal, save, analyze
-            if "attachments" in entry:
-                image_atts = [a for a in entry["attachments"]
-                              if a.get("contentType", "") in IMAGE_CONTENT_TYPES]
-                if image_atts:
-                    saved, analyses = process_image_attachments(
-                        image_atts, entry["signal_timestamp"], body,
-                    )
-                    for path, analysis in zip(saved, analyses):
-                        if analysis:
-                            status = analysis.get("protocol_status", "?")
-                            cal = analysis.get("calories", 0)
-                            meal_type = analysis.get("meal_type", "meal")
-                            send_message(
-                                f"[meal] {path.name} — {meal_type} — {status} PROTOCOL ~{cal} kcal"
-                            )
-                        else:
-                            send_message(f"[photo] {path.name}")
-
-            # Skip messages that are photo-only with no text
-            if not body:
-                HEALTH_FILE.write_text(datetime.now().isoformat())
-                continue
-
             try:
+                # Insert into DB and confirm immediately
                 inserted = insert_messages(conn, [entry])
                 if inserted:
                     ts = datetime.fromtimestamp(entry["signal_timestamp"] / 1000)
                     print(f"[{ts.strftime('%H:%M')}] {body[:80]}", flush=True)
-
-                    # Confirmation 1: captured
                     send_message(f"[vault] captured.")
 
+                # Process image attachments: classify meal vs non-meal, save, analyze
+                if "attachments" in entry:
+                    image_atts = [a for a in entry["attachments"]
+                                  if a.get("contentType", "") in IMAGE_CONTENT_TYPES]
+                    if image_atts:
+                        saved, analyses = process_image_attachments(
+                            image_atts, entry["signal_timestamp"], body,
+                        )
+                        for path, analysis in zip(saved, analyses):
+                            if analysis:
+                                status = analysis.get("protocol_status", "?")
+                                cal = analysis.get("calories", 0)
+                                meal_type = analysis.get("meal_type", "meal")
+                                send_message(
+                                    f"[meal] {path.name} — {meal_type} — {status} PROTOCOL ~{cal} kcal"
+                                )
+                            else:
+                                send_message(f"[photo] {path.name}")
+
+                # Skip text routing for photo-only messages
+                if not body:
+                    HEALTH_FILE.write_text(datetime.now().isoformat())
+                    continue
+
+                # Route text messages
+                if inserted:
                     if is_salience(body):
                         process_salience(body, entry["signal_timestamp"])
                         send_message(f"[sorted] salience — {body}")
