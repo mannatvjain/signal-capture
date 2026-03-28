@@ -21,7 +21,7 @@ Signal "Note to Self" → signal-cli daemon → SQLite database
 
 ### Package (`signal_capture/`)
 - `cli.py` — Entry point. Subcommands: `poll`, `daemon`, `view`, `list`, `count`, `health`
-- `capture.py` — Core: signal-cli subprocess, DB init, message insertion, config loading
+- `capture.py` — Core: signal-cli subprocess, DB init, message insertion, config loading, `send_alert(text, attachments=)`
 - `daemon.py` — Persistent daemon: runs signal-cli in daemon mode with Unix socket, handles confirmations, corrections, and routing
 - `cards.py` — Anki card detection (`Q./A.`, `C.{cloze}`), daily note creation from template, `## Signal` section management, `anki-sync` triggering
 - `triage.py` — Claude classification via `claude -p --model haiku --json-schema`, routing to vault files, rerouting on corrections

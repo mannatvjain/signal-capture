@@ -21,32 +21,44 @@ QA_MULTI_LINE = re.compile(r"^Q\.\s+", re.MULTILINE)
 CLOZE_PATTERN = re.compile(r"^C\.\s+.*\{.+\}", re.MULTILINE)
 
 
-def is_card(body: str) -> bool:
-    """Check if a message contains an Anki card."""
-    body = body.strip()
-    if QA_SINGLE_LINE.match(body):
+def _split_blocks(body: str) -> list[str]:
+    """Split a message into blocks separated by blank lines."""
+    blocks = re.split(r"\n\s*\n", body.strip())
+    return [b.strip() for b in blocks if b.strip()]
+
+
+def _is_single_card(block: str) -> bool:
+    """Check if a single block is an Anki card."""
+    if QA_SINGLE_LINE.match(block):
         return True
-    if QA_MULTI_LINE.match(body) and re.search(r"^A\.\s+", body, re.MULTILINE):
+    if QA_MULTI_LINE.match(block) and re.search(r"^A\.\s+", block, re.MULTILINE):
         return True
-    if CLOZE_PATTERN.match(body):
+    if CLOZE_PATTERN.match(block):
         return True
     return False
+
+
+def is_card(body: str) -> bool:
+    """Check if a message contains one or more Anki cards."""
+    blocks = _split_blocks(body)
+    return len(blocks) > 0 and all(_is_single_card(b) for b in blocks)
+
+
+def _format_single_card(block: str) -> str:
+    """Format a single card block for Obsidian-to-Anki."""
+    m = QA_SINGLE_LINE.match(block)
+    if m:
+        return f"Q. {m.group(1).strip()}\nA. {m.group(2).strip()}"
+    return block
 
 
 def format_card(body: str) -> str:
     """Format a message into the correct card syntax for Obsidian-to-Anki.
 
-    Ensures Q./A. are on separate lines so the regex fires.
+    Splits multi-card messages and ensures Q./A. are on separate lines.
     """
-    body = body.strip()
-
-    # Single-line Q. ... A. ... → split onto two lines
-    m = QA_SINGLE_LINE.match(body)
-    if m:
-        return f"Q. {m.group(1).strip()}\nA. {m.group(2).strip()}"
-
-    # Already multi-line or cloze — return as-is
-    return body
+    blocks = _split_blocks(body)
+    return "\n\n".join(_format_single_card(b) for b in blocks)
 
 
 def get_daily_note_path(dt: datetime) -> Path:

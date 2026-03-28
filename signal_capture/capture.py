@@ -40,20 +40,33 @@ if CONFIG_FILE.exists():
             ALERT_RECIPIENT = val
 
 
-def send_alert(text: str) -> bool:
-    """Send a push notification via the GV bot account. Returns True on success."""
+def send_alert(text: str, attachments: list[str] | None = None) -> int | None:
+    """Send a push notification via the GV bot account.
+
+    Returns the sent message's Signal timestamp (ms) on success, None on failure.
+    Truthy/falsy behavior is preserved for existing callers.
+    """
     if not ALERT_ACCOUNT or not ALERT_RECIPIENT:
         print("Alert account not configured.", file=sys.stderr)
-        return False
+        return None
     try:
+        cmd = [SIGNAL_CLI, "-a", ALERT_ACCOUNT, "--output=json", "send", "-m", text, ALERT_RECIPIENT]
+        if attachments:
+            for a in attachments:
+                cmd.extend(["--attachment", a])
         result = subprocess.run(
-            [SIGNAL_CLI, "-a", ALERT_ACCOUNT, "send", "-m", text, ALERT_RECIPIENT],
-            capture_output=True, text=True, timeout=15,
+            cmd, capture_output=True, text=True, timeout=30,
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout.strip().splitlines()[-1])
+                return data.get("timestamp") or int(datetime.now().timestamp() * 1000)
+            except (json.JSONDecodeError, IndexError):
+                return int(datetime.now().timestamp() * 1000)
+        return None
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"Alert send failed: {e}", file=sys.stderr)
-        return False
+        return None
 
 
 def init_db() -> sqlite3.Connection:
