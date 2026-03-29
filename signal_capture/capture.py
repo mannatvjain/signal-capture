@@ -96,6 +96,11 @@ def init_db() -> sqlite3.Connection:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()}
     if "cancelled" not in cols:
         conn.execute("ALTER TABLE reminders ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0")
+    # Migration: add obsidian_synced column for card retry tracking
+    # NULL = not a card, 0 = card pending sync, 1 = card synced to Obsidian
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
+    if "obsidian_synced" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN obsidian_synced INTEGER")
     conn.commit()
     return conn
 

@@ -18,7 +18,7 @@ QA_SINGLE_LINE = re.compile(r"^Q\.\s+(.+?)\s+A\.\s+(.+)$", re.DOTALL)
 # Q. ... already on separate lines
 QA_MULTI_LINE = re.compile(r"^Q\.\s+", re.MULTILINE)
 # Cloze: C. ... with {braces}
-CLOZE_PATTERN = re.compile(r"^C\.\s+.*\{.+\}", re.MULTILINE)
+CLOZE_PATTERN = re.compile(r"^C\.\s+.*\{.+\}", re.MULTILINE | re.DOTALL)
 
 
 def _split_blocks(body: str) -> list[str]:
@@ -101,6 +101,20 @@ def append_card_to_daily_note(card_text: str, dt: datetime) -> Path:
     return path
 
 
+def anki_pre_sync() -> bool:
+    """Pull AnkiWeb → local Anki before appending cards. Blocking. Returns True on success."""
+    try:
+        result = subprocess.run(
+            [str(ANKI_SYNC_BIN), "--sync-only"],
+            timeout=60,
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"anki pre-sync failed: {e}", flush=True)
+        return False
+
+
 def trigger_anki_sync() -> None:
     """Fire anki-sync (full: scan vault + sync to AnkiWeb)."""
     try:
@@ -118,11 +132,18 @@ def is_salience(body: str) -> bool:
     return body.strip().lower().startswith("[salience]")
 
 
-def process_salience(body: str, signal_timestamp: int) -> bool:
-    """Strip [salience] prefix, format the card, and append to Running Salience. Returns True if processed."""
+def process_salience(body: str, signal_timestamp: int) -> str:
+    """Strip [salience] prefix, format the card, and append to Running Salience.
+
+    Returns 'success', 'not_card', or 'sync_failed'.
+    """
     stripped = re.sub(r"^\[salience\]\s*", "", body.strip(), flags=re.IGNORECASE)
     if not is_card(stripped):
-        return False
+        return "not_card"
+
+    if not anki_pre_sync():
+        print("Pre-sync failed, deferring salience card", flush=True)
+        return "sync_failed"
 
     card_text = format_card(stripped)
     content = SALIENCE_PATH.read_text() if SALIENCE_PATH.exists() else ""
@@ -132,13 +153,20 @@ def process_salience(body: str, signal_timestamp: int) -> bool:
     print(f"Salience prompt appended to {SALIENCE_PATH.name}", flush=True)
     trigger_anki_sync()
     print("anki-sync triggered", flush=True)
-    return True
+    return "success"
 
 
-def process_card(body: str, signal_timestamp: int) -> bool:
-    """If the message is a card, append to daily note and sync. Returns True if processed."""
+def process_card(body: str, signal_timestamp: int) -> str:
+    """If the message is a card, append to daily note and sync.
+
+    Returns 'success', 'not_card', or 'sync_failed'.
+    """
     if not is_card(body):
-        return False
+        return "not_card"
+
+    if not anki_pre_sync():
+        print("Pre-sync failed, deferring card", flush=True)
+        return "sync_failed"
 
     dt = datetime.fromtimestamp(signal_timestamp / 1000)
     card_text = format_card(body)
@@ -147,5 +175,4 @@ def process_card(body: str, signal_timestamp: int) -> bool:
 
     trigger_anki_sync()
     print("anki-sync triggered", flush=True)
-
-    return True
+    return "success"

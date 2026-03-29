@@ -260,6 +260,38 @@ def handle_correction(entry: dict, conn) -> bool:
     return True
 
 
+def _mark_obsidian_synced(conn, signal_timestamp: int, status: int):
+    """Set obsidian_synced for a message. 0 = pending, 1 = done."""
+    conn.execute(
+        "UPDATE messages SET obsidian_synced = ? WHERE signal_timestamp = ?",
+        (status, signal_timestamp),
+    )
+    conn.commit()
+
+
+def retry_unsynced_cards(conn):
+    """Retry appending any cards whose pre-sync previously failed."""
+    rows = conn.execute(
+        "SELECT signal_timestamp, body FROM messages WHERE obsidian_synced = 0"
+    ).fetchall()
+
+    for signal_timestamp, body in rows:
+        if is_salience(body):
+            result = process_salience(body, signal_timestamp)
+        elif is_card(body):
+            result = process_card(body, signal_timestamp)
+        else:
+            # Not a card — shouldn't have obsidian_synced=0, fix it
+            _mark_obsidian_synced(conn, signal_timestamp, 1)
+            continue
+
+        if result == "success":
+            _mark_obsidian_synced(conn, signal_timestamp, 1)
+            label = "salience" if is_salience(body) else "card"
+            send_message(f"[sorted] {label} — {body}")
+            print(f"Retry succeeded for {signal_timestamp}", flush=True)
+
+
 def run_daemon():
     """Run signal-cli daemon and process messages as they stream in."""
     if not ACCOUNT:
@@ -295,6 +327,9 @@ def run_daemon():
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+            # Retry any cards that failed pre-sync on previous iterations
+            retry_unsynced_cards(conn)
 
             entry = extract_entry(msg)
             if not entry:
@@ -345,11 +380,21 @@ def run_daemon():
                 # Route text messages
                 if inserted:
                     if is_salience(body):
-                        process_salience(body, entry["signal_timestamp"])
-                        send_message(f"[sorted] salience — {body}")
+                        _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
+                        result = process_salience(body, entry["signal_timestamp"])
+                        if result == "success":
+                            _mark_obsidian_synced(conn, entry["signal_timestamp"], 1)
+                            send_message(f"[sorted] salience — {body}")
+                        elif result == "sync_failed":
+                            send_message(f"[vault] card queued (Anki sync pending)")
                     elif is_card(body):
-                        process_card(body, entry["signal_timestamp"])
-                        send_message(f"[sorted] card — {body}")
+                        _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
+                        result = process_card(body, entry["signal_timestamp"])
+                        if result == "success":
+                            _mark_obsidian_synced(conn, entry["signal_timestamp"], 1)
+                            send_message(f"[sorted] card — {body}")
+                        elif result == "sync_failed":
+                            send_message(f"[vault] card queued (Anki sync pending)")
                     else:
                         category = route_message(body, entry["signal_timestamp"])
                         if category:
