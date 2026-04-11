@@ -18,7 +18,7 @@ from signal_capture.capture import (
     ACCOUNT, DB_PATH, HEALTH_FILE, SIGNAL_CLI,
     init_db, insert_messages,
 )
-from signal_capture.cards import process_card, is_card, is_salience, process_salience
+from signal_capture.cards import process_card, is_card, is_salience, process_salience, is_blot, process_blot, blot_text
 from signal_capture.meals import IMAGE_CONTENT_TYPES, process_image_attachments
 from signal_capture.triage import (
     route_message, reroute_message,
@@ -276,7 +276,9 @@ def retry_unsynced_cards(conn):
     ).fetchall()
 
     for signal_timestamp, body in rows:
-        if is_salience(body):
+        if is_blot(body):
+            result = process_blot(body, signal_timestamp)
+        elif is_salience(body):
             result = process_salience(body, signal_timestamp)
         elif is_card(body):
             result = process_card(body, signal_timestamp)
@@ -287,8 +289,13 @@ def retry_unsynced_cards(conn):
 
         if result == "success":
             _mark_obsidian_synced(conn, signal_timestamp, 1)
-            label = "salience" if is_salience(body) else "card"
-            send_message(f"[sorted] {label} — {body}")
+            if is_blot(body):
+                blot_body = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
+                blotted = blot_text(blot_body)
+                send_message(f"[sorted] card — Q. {blotted}\nA. {blot_body}")
+            else:
+                label = "salience" if is_salience(body) else "card"
+                send_message(f"[sorted] {label} — {body}")
             print(f"Retry succeeded for {signal_timestamp}", flush=True)
 
 
@@ -379,7 +386,17 @@ def run_daemon():
 
                 # Route text messages
                 if inserted:
-                    if is_salience(body):
+                    if is_blot(body):
+                        _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
+                        result = process_blot(body, entry["signal_timestamp"])
+                        if result == "success":
+                            _mark_obsidian_synced(conn, entry["signal_timestamp"], 1)
+                            blot_body = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
+                            blotted = blot_text(blot_body)
+                            send_message(f"[sorted] card — Q. {blotted}\nA. {blot_body}")
+                        elif result == "sync_failed":
+                            send_message(f"[vault] card queued (Anki sync pending)")
+                    elif is_salience(body):
                         _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
                         result = process_salience(body, entry["signal_timestamp"])
                         if result == "success":

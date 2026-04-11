@@ -127,6 +127,64 @@ def trigger_anki_sync() -> None:
         pass  # anki-sync not installed, skip silently
 
 
+def blot_text(text: str) -> str:
+    """Transform text so each word shows only its first letter, rest as dots.
+
+    Preserves punctuation at word boundaries, capitalization, and numbers.
+    Words are split on spaces only. Hyphenated words and contractions are one unit.
+    """
+    words = text.split(" ")
+    result = []
+    for word in words:
+        if not word:
+            result.append(word)
+            continue
+        # Strip trailing punctuation to handle "study;" -> "s....;"
+        trail = ""
+        core = word
+        while core and core[-1] in ".,;:!?)\"'":
+            trail = core[-1] + trail
+            core = core[:-1]
+        if not core:
+            # Entirely punctuation
+            result.append(word)
+        elif len(core) == 1:
+            result.append(core + trail)
+        else:
+            result.append(core[0] + "." * (len(core) - 1) + trail)
+    return " ".join(result)
+
+
+def is_blot(body: str) -> bool:
+    """Check if a message is a blot request (prefixed with [blot])."""
+    return body.strip().lower().startswith("[blot]")
+
+
+def process_blot(body: str, signal_timestamp: int) -> str:
+    """Strip [blot] prefix, generate Q (blotted) / A (original) card, append to daily note.
+
+    Returns 'success', 'not_card', or 'sync_failed'.
+    """
+    stripped = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
+    if not stripped:
+        return "not_card"
+
+    blotted = blot_text(stripped)
+    card_text = f"Q. {blotted}\nA. {stripped}"
+
+    if not anki_pre_sync():
+        print("Pre-sync failed, deferring blot card", flush=True)
+        return "sync_failed"
+
+    dt = datetime.fromtimestamp(signal_timestamp / 1000)
+    path = append_card_to_daily_note(card_text, dt)
+    print(f"Blot card appended to {path.name}", flush=True)
+
+    trigger_anki_sync()
+    print("anki-sync triggered", flush=True)
+    return "success"
+
+
 def is_salience(body: str) -> bool:
     """Check if a message is a salience prompt (prefixed with [salience])."""
     return body.strip().lower().startswith("[salience]")
