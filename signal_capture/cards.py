@@ -1,16 +1,20 @@
 """
-Card detection, daily note management, and anki-sync triggering.
+Card detection and daily-note appending.
+
+Q./A./C. messages are written verbatim to the user's daily note under
+## Signal; the obsidian-to-anki plugin parses them directly.
 """
 
 import re
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 
-VAULT_ROOT = Path.home() / "Documents" / "Obsidian Vaults" / "dot"
+VAULT_ROOT = Path.home() / "Documents" / "dot"
 TEMPLATE_PATH = VAULT_ROOT / "CLAUDE" / "Templates" / "1 daily-template.md"
 SALIENCE_PATH = VAULT_ROOT / "CLAUDE" / "Running Salience.md"
-ANKI_SYNC_BIN = Path.home() / "bin" / "anki-sync"
+ANKI_SYNC_BIN = VAULT_ROOT / "CLAUDE" / "Artifacts" / "anki-sync"
 
 # Patterns to detect cards in messages
 # Q. ... A. ... on one line (user texting shorthand)
@@ -44,30 +48,13 @@ def is_card(body: str) -> bool:
     return len(blocks) > 0 and all(_is_single_card(b) for b in blocks)
 
 
-def _format_single_card(block: str) -> str:
-    """Format a single card block for Obsidian-to-Anki."""
-    m = QA_SINGLE_LINE.match(block)
-    if m:
-        return f"Q. {m.group(1).strip()}\nA. {m.group(2).strip()}"
-    return block
-
-
-def format_card(body: str) -> str:
-    """Format a message into the correct card syntax for Obsidian-to-Anki.
-
-    Splits multi-card messages and ensures Q./A. are on separate lines.
-    """
-    blocks = _split_blocks(body)
-    return "\n\n".join(_format_single_card(b) for b in blocks)
-
-
 def get_daily_note_path(dt: datetime) -> Path:
     """Get the path to the daily note for a given datetime."""
-    year_num = dt.year - 2024
+    year_num = dt.year - 2025
     year_folder = f"{year_num}-{dt.year}"
-    month_folder = f"{dt.month}-{dt.strftime('%B')}"
+    month_folder = f"{dt.month - 4}-{dt.strftime('%B')}"
     filename = dt.strftime("%m-%d") + ".md"
-    return VAULT_ROOT / "0-Inbox" / year_folder / month_folder / filename
+    return VAULT_ROOT / "0-Journal" / year_folder / month_folder / filename
 
 
 def ensure_daily_note(path: Path, dt: datetime) -> None:
@@ -115,14 +102,31 @@ def anki_pre_sync() -> bool:
         return False
 
 
+_sync_timer: threading.Timer | None = None
+_sync_lock = threading.Lock()
+_SYNC_DEBOUNCE = 10  # seconds — wait for burst of cards to finish
+
+
 def trigger_anki_sync() -> None:
-    """Fire anki-sync (full: scan vault + sync to AnkiWeb)."""
+    """Fire anki-sync, debounced. Resets timer on each call so a burst of cards syncs once."""
+    global _sync_timer
+    with _sync_lock:
+        if _sync_timer is not None:
+            _sync_timer.cancel()
+        _sync_timer = threading.Timer(_SYNC_DEBOUNCE, _fire_anki_sync)
+        _sync_timer.daemon = True
+        _sync_timer.start()
+
+
+def _fire_anki_sync() -> None:
+    """Actually fire anki-sync after debounce window."""
     try:
         subprocess.Popen(
             [str(ANKI_SYNC_BIN)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        print("anki-sync triggered (debounced)", flush=True)
     except FileNotFoundError:
         pass  # anki-sync not installed, skip silently
 
@@ -139,6 +143,7 @@ def blot_text(text: str) -> str:
         if not word:
             result.append(word)
             continue
+        # Find leading letter/digit content and trailing punctuation
         # Strip trailing punctuation to handle "study;" -> "s....;"
         trail = ""
         core = word
@@ -161,27 +166,21 @@ def is_blot(body: str) -> bool:
 
 
 def process_blot(body: str, signal_timestamp: int) -> str:
-    """Strip [blot] prefix, generate Q (blotted) / A (original) card, append to daily note.
-
-    Returns 'success', 'not_card', or 'sync_failed'.
-    """
+    """Strip [blot] prefix, generate Q (blotted) / A (original) card, append to daily note."""
     stripped = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
     if not stripped:
         return "not_card"
-
-    blotted = blot_text(stripped)
-    card_text = f"Q. {blotted}\nA. {stripped}"
 
     if not anki_pre_sync():
         print("Pre-sync failed, deferring blot card", flush=True)
         return "sync_failed"
 
+    card_text = f"Q. {blot_text(stripped)}\nA. {stripped}"
+
     dt = datetime.fromtimestamp(signal_timestamp / 1000)
     path = append_card_to_daily_note(card_text, dt)
     print(f"Blot card appended to {path.name}", flush=True)
-
     trigger_anki_sync()
-    print("anki-sync triggered", flush=True)
     return "success"
 
 
@@ -191,10 +190,7 @@ def is_salience(body: str) -> bool:
 
 
 def process_salience(body: str, signal_timestamp: int) -> str:
-    """Strip [salience] prefix, format the card, and append to Running Salience.
-
-    Returns 'success', 'not_card', or 'sync_failed'.
-    """
+    """Strip [salience] prefix and append the raw card text to Running Salience."""
     stripped = re.sub(r"^\[salience\]\s*", "", body.strip(), flags=re.IGNORECASE)
     if not is_card(stripped):
         return "not_card"
@@ -203,22 +199,16 @@ def process_salience(body: str, signal_timestamp: int) -> str:
         print("Pre-sync failed, deferring salience card", flush=True)
         return "sync_failed"
 
-    card_text = format_card(stripped)
     content = SALIENCE_PATH.read_text() if SALIENCE_PATH.exists() else ""
-    content = content.rstrip() + "\n\n" + card_text + "\n"
+    content = content.rstrip() + "\n\n" + stripped + "\n"
     SALIENCE_PATH.write_text(content)
-
     print(f"Salience prompt appended to {SALIENCE_PATH.name}", flush=True)
     trigger_anki_sync()
-    print("anki-sync triggered", flush=True)
     return "success"
 
 
 def process_card(body: str, signal_timestamp: int) -> str:
-    """If the message is a card, append to daily note and sync.
-
-    Returns 'success', 'not_card', or 'sync_failed'.
-    """
+    """Append raw card text to today's daily note ## Signal, trigger anki-sync."""
     if not is_card(body):
         return "not_card"
 
@@ -227,10 +217,8 @@ def process_card(body: str, signal_timestamp: int) -> str:
         return "sync_failed"
 
     dt = datetime.fromtimestamp(signal_timestamp / 1000)
-    card_text = format_card(body)
-    path = append_card_to_daily_note(card_text, dt)
+    path = append_card_to_daily_note(body.strip(), dt)
     print(f"Card appended to {path.name}", flush=True)
 
     trigger_anki_sync()
-    print("anki-sync triggered", flush=True)
     return "success"

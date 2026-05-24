@@ -18,29 +18,36 @@ from pathlib import Path
 
 from signal_capture.capture import (
     ACCOUNT, DB_PATH, HEALTH_FILE, SIGNAL_CLI,
-    init_db, insert_messages,
+    init_db, insert_messages, send_alert,
 )
-from signal_capture.cards import process_card, is_card, is_salience, process_salience, is_blot, process_blot, blot_text
-from signal_capture.meals import IMAGE_CONTENT_TYPES, process_image_attachments
 from signal_capture.triage import (
     route_message, reroute_message,
     cancel_reminder_by_timestamp, reschedule_reminder_by_timestamp, parse_reschedule_time,
 )
+from signal_capture.cards import (
+    is_card, process_card,
+    is_blot, process_blot, blot_text,
+    is_salience, process_salience,
+)
+from signal_capture.meals import IMAGE_CONTENT_TYPES, estimate_calories, resolve_attachment
 from signal_capture import notion
 
 SOCKET_PATH = Path.home() / ".signal-capture.socket"
 
-VALID_CATEGORIES = {"reminder", "resource", "todo", "good-advice", "founders", "deltas", "sundry"}
+VALID_CATEGORIES = {"reminder", "todo"}
 
-# Match reply corrections like "todo", "founders", "reminder"
-CORRECTION_PATTERN = re.compile(
-    r"^(reminder|resource|todo|good-advice|founders|deltas|sundry)$",
-    re.IGNORECASE,
-)
+CORRECTION_PATTERN = re.compile(r"^(reminder|todo|resource|sundry)$", re.IGNORECASE)
+
+DEBOUNCE_SECONDS = 8
+
+_pending_sorted: list[tuple[str, str]] = []
+_pending_lock = threading.Lock()
+_last_message_at: datetime | None = None
 
 
 def send_message(text: str):
     """Send a Note to Self message via the daemon's JSON-RPC socket."""
+    from signal_capture.capture import _recv_all
     request = json.dumps({
         "jsonrpc": "2.0",
         "id": 1,
@@ -52,15 +59,15 @@ def send_message(text: str):
         },
     }) + "\n"
 
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(str(SOCKET_PATH))
         sock.sendall(request.encode())
-        sock.settimeout(5)
-        sock.recv(4096)
-        sock.close()
+        _recv_all(sock, timeout=5)
     except (ConnectionRefusedError, FileNotFoundError, TimeoutError, OSError) as e:
         print(f"Send failed: {e}", flush=True)
+    finally:
+        sock.close()
 
 
 def extract_entry(msg: dict) -> dict | None:
@@ -231,10 +238,6 @@ def handle_correction(entry: dict, conn) -> bool:
             return False
         original_body = parts[1]
         old_category = parts[0].replace("[sorted] ", "").strip()
-        if old_category == "card":
-            print("Ignoring correction on card message.", flush=True)
-            send_message("[error] Cards can't be rerouted.")
-            return True
     else:
         # Format: "[rerouted] old → new — original_body"
         parts = quote_text.split(" — ", 1)
@@ -263,47 +266,43 @@ def handle_correction(entry: dict, conn) -> bool:
     return True
 
 
-def _mark_obsidian_synced(conn, signal_timestamp: int, status: int):
-    """Set obsidian_synced for a message. 0 = pending, 1 = done."""
-    conn.execute(
-        "UPDATE messages SET obsidian_synced = ? WHERE signal_timestamp = ?",
-        (status, signal_timestamp),
-    )
-    conn.commit()
+def _flush_pending_sorted():
+    """Send all queued [sorted] confirmations as one batched message."""
+    with _pending_lock:
+        if not _pending_sorted:
+            return
+        items = list(_pending_sorted)
+        _pending_sorted.clear()
+
+    if len(items) == 1:
+        category, body = items[0]
+        send_message(f"[sorted] {category} — {body}")
+        return
+
+    lines = [f"[sorted] {len(items)} captures"]
+    for category, body in items:
+        lines.append(f"— {category}: {body}")
+    send_message("\n".join(lines))
 
 
-def retry_unsynced_cards(conn):
-    """Retry appending any cards whose pre-sync previously failed."""
-    rows = conn.execute(
-        "SELECT signal_timestamp, body FROM messages WHERE obsidian_synced = 0"
-    ).fetchall()
-
-    for signal_timestamp, body in rows:
-        if is_blot(body):
-            result = process_blot(body, signal_timestamp)
-        elif is_salience(body):
-            result = process_salience(body, signal_timestamp)
-        elif is_card(body):
-            result = process_card(body, signal_timestamp)
-        else:
-            # Not a card — shouldn't have obsidian_synced=0, fix it
-            _mark_obsidian_synced(conn, signal_timestamp, 1)
-            continue
-
-        if result == "success":
-            _mark_obsidian_synced(conn, signal_timestamp, 1)
-            if is_blot(body):
-                blot_body = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
-                blotted = blot_text(blot_body)
-                send_message(f"[sorted] card — Q. {blotted}\nA. {blot_body}")
-            else:
-                label = "salience" if is_salience(body) else "card"
-                send_message(f"[sorted] {label} — {body}")
-            print(f"Retry succeeded for {signal_timestamp}", flush=True)
+def _debounce_flusher():
+    """Background thread: flush pending [sorted]s after DEBOUNCE_SECONDS of quiet."""
+    while True:
+        time.sleep(1)
+        with _pending_lock:
+            should_flush = (
+                bool(_pending_sorted)
+                and _last_message_at is not None
+                and (datetime.now() - _last_message_at).total_seconds() >= DEBOUNCE_SECONDS
+            )
+        if should_flush:
+            _flush_pending_sorted()
 
 
 def run_daemon():
     """Run signal-cli daemon and process messages as they stream in."""
+    global _last_message_at
+
     if not ACCOUNT:
         print("Error: SIGNAL_ACCOUNT not set.", file=sys.stderr)
         sys.exit(1)
@@ -327,6 +326,12 @@ def run_daemon():
 
     print("Daemon running. Waiting for messages...", flush=True)
 
+    def _health_writer():
+        """Periodically update health file to prove daemon is alive."""
+        while True:
+            HEALTH_FILE.write_text(datetime.now().isoformat())
+            time.sleep(300)  # Every 5 minutes
+
     def _notion_drainer():
         """Periodically drain any queued Notion todos that previously failed."""
         while True:
@@ -336,6 +341,8 @@ def run_daemon():
             except Exception as e:
                 print(f"Notion drain error: {e}", flush=True)
 
+    threading.Thread(target=_health_writer, daemon=True).start()
+    threading.Thread(target=_debounce_flusher, daemon=True).start()
     threading.Thread(target=_notion_drainer, daemon=True).start()
 
     try:
@@ -348,9 +355,6 @@ def run_daemon():
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
-            # Retry any cards that failed pre-sync on previous iterations
-            retry_unsynced_cards(conn)
 
             entry = extract_entry(msg)
             if not entry:
@@ -373,63 +377,64 @@ def run_daemon():
                     ts = datetime.fromtimestamp(entry["signal_timestamp"] / 1000)
                     print(f"[{ts.strftime('%H:%M')}] {body[:80]}", flush=True)
                     send_message(f"[vault] captured.")
+                    with _pending_lock:
+                        _last_message_at = datetime.now()
 
-                # Process image attachments: classify meal vs non-meal, save, analyze
-                if "attachments" in entry:
-                    image_atts = [a for a in entry["attachments"]
-                                  if a.get("contentType", "") in IMAGE_CONTENT_TYPES]
-                    if image_atts:
-                        saved, analyses = process_image_attachments(
-                            image_atts, entry["signal_timestamp"], body,
-                        )
-                        for path, analysis in zip(saved, analyses):
-                            if analysis:
-                                status = analysis.get("protocol_status", "?")
-                                cal = analysis.get("calories", 0)
-                                meal_type = analysis.get("meal_type", "meal")
-                                send_message(
-                                    f"[meal] {path.name} — {meal_type} — {status} PROTOCOL ~{cal} kcal"
-                                )
-                            else:
-                                send_message(f"[photo] {path.name}")
-
-                # Skip text routing for photo-only messages
-                if not body:
+                # Photo + "meal" in caption → ask the model for a calorie breakdown,
+                # send the answer back through Summertime. Nothing saved or logged.
+                attachments = entry.get("attachments") or []
+                images = [a for a in attachments if a.get("contentType") in IMAGE_CONTENT_TYPES]
+                if inserted and images and "meal" in body.lower():
+                    for att in images:
+                        path = resolve_attachment(att)
+                        if not path:
+                            continue
+                        breakdown = estimate_calories(path, body)
+                        send_alert(f"[meal]\n{breakdown}" if breakdown else "[meal] couldn't estimate")
                     HEALTH_FILE.write_text(datetime.now().isoformat())
                     continue
 
-                # Route text messages
+                # Skip text routing for empty messages (and image-only messages
+                # without the "meal" trigger word — we just ignore those now).
+                if not body or (images and not body.replace(" ", "")):
+                    HEALTH_FILE.write_text(datetime.now().isoformat())
+                    continue
+
+                # Cards (blot / salience / Q.A. / cloze) take priority over triage.
+                # All confirmations queue through the debounce flusher.
                 if inserted:
                     if is_blot(body):
-                        _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
                         result = process_blot(body, entry["signal_timestamp"])
                         if result == "success":
-                            _mark_obsidian_synced(conn, entry["signal_timestamp"], 1)
                             blot_body = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
                             blotted = blot_text(blot_body)
-                            send_message(f"[sorted] card — Q. {blotted}\nA. {blot_body}")
+                            with _pending_lock:
+                                _pending_sorted.append(("card", f"Q. {blotted}\nA. {blot_body}"))
+                                _last_message_at = datetime.now()
                         elif result == "sync_failed":
-                            send_message(f"[vault] card queued (Anki sync pending)")
+                            send_message("[vault] card queued (Anki sync pending)")
                     elif is_salience(body):
-                        _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
                         result = process_salience(body, entry["signal_timestamp"])
                         if result == "success":
-                            _mark_obsidian_synced(conn, entry["signal_timestamp"], 1)
-                            send_message(f"[sorted] salience — {body}")
+                            with _pending_lock:
+                                _pending_sorted.append(("salience", body))
+                                _last_message_at = datetime.now()
                         elif result == "sync_failed":
-                            send_message(f"[vault] card queued (Anki sync pending)")
+                            send_message("[vault] card queued (Anki sync pending)")
                     elif is_card(body):
-                        _mark_obsidian_synced(conn, entry["signal_timestamp"], 0)
                         result = process_card(body, entry["signal_timestamp"])
                         if result == "success":
-                            _mark_obsidian_synced(conn, entry["signal_timestamp"], 1)
-                            send_message(f"[sorted] card — {body}")
+                            with _pending_lock:
+                                _pending_sorted.append(("card", body))
+                                _last_message_at = datetime.now()
                         elif result == "sync_failed":
-                            send_message(f"[vault] card queued (Anki sync pending)")
+                            send_message("[vault] card queued (Anki sync pending)")
                     else:
                         category = route_message(body, entry["signal_timestamp"])
                         if category:
-                            send_message(f"[sorted] {category} — {body}")
+                            with _pending_lock:
+                                _pending_sorted.append((category, body))
+                                _last_message_at = datetime.now()
             except Exception as e:
                 print(f"Error processing message: {e}", flush=True)
                 send_message(f"[error] failed to process: {e}")

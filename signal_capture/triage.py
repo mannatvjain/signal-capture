@@ -12,21 +12,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from signal_capture.capture import DB_PATH
+from signal_capture.capture import DB_PATH, VAULT_ROOT
 from signal_capture.cards import get_daily_note_path, ensure_daily_note
 from signal_capture import notion
 
-VAULT_ROOT = Path.home() / "Documents" / "Obsidian Vaults" / "dot"
-SUNDRY = VAULT_ROOT / "4-Sundry"
+SUNDRY_DIR = VAULT_ROOT / "4-Sundry"
 
 TARGETS = {
-    "reminder": None,  # reminders table in capture.db
-    "resource": None,  # daily note ## Links
-    "todo": None,      # daily note ### Todo
-    "good-advice": SUNDRY / "A list of good advice.md",
-    "founders": SUNDRY / "Founders.md",
-    "deltas": SUNDRY / "Running Deltas.md",
-    "sundry": SUNDRY / "Running Sundry.md",
+    "reminder": None,                                 # reminders table in capture.db
+    "todo": None,                                     # daily note ### Todo
+    "resource": None,                                 # daily note ## Links
+    "sundry": SUNDRY_DIR / "Running Sundry.md",
 }
 
 CLASSIFY_PROMPT_TEMPLATE = """\
@@ -36,12 +32,9 @@ Current time: {current_time}
 
 Categories:
 - "reminder": Time-bound reminders — messages that reference a specific time to be reminded about something (e.g. "speak with colin about mechinterp at 1pm tomorrow", "remind me to call mom at 5", "gym at 3pm"). The key signal is a specific time/date to fire the reminder.
-- "resource": Links, articles, papers, videos, things to look at or read
-- "todo": Near-term actionable items with time pressure but NO specific reminder time (e.g. "email Prof Fusi this week"). NOT vague aspirations like "read more books" or "explore X someday"
-- "good-advice": Wisdom, life advice, principles to remember
-- "founders": Specifically about David Senra's Founders Podcast (episodes, quotes, takeaways)
-- "deltas": Changes, updates, observations about how things are going or shifting
-- "sundry": Everything else — random thoughts, observations, ideas that don't fit above
+- "todo": Near-term actionable items with time pressure but NO specific reminder time (e.g. "email Prof Fusi this week"). NOT vague aspirations like "read more books" or "explore X someday".
+- "resource": Links, articles, papers, videos, or named things to look at or read later.
+- "sundry": Anything that doesn't fit above — random thoughts, observations, advice, questions, reflections.
 
 For "reminder" messages:
 - "cleaned": A short description of what to be reminded about
@@ -63,7 +56,7 @@ CLASSIFICATION_SCHEMA = json.dumps({
     "properties": {
         "category": {
             "type": "string",
-            "enum": ["reminder", "resource", "todo", "good-advice", "founders", "deltas", "sundry"],
+            "enum": ["reminder", "todo", "resource", "sundry"],
         },
         "cleaned": {"type": ["string", "null"]},
         "context": {"type": ["string", "null"]},
@@ -82,7 +75,7 @@ def classify_message(body: str) -> dict | None:
     try:
         result = subprocess.run(
             [
-                "/Users/mannatvjain/.local/bin/claude", "-p",
+                "/Users/mannat/.local/bin/claude", "-p",
                 "--model", "haiku",
                 "--output-format", "json",
                 "--json-schema", CLASSIFICATION_SCHEMA,
@@ -116,29 +109,19 @@ def route_resource(body: str, dt: datetime) -> None:
     ensure_daily_note(path, dt)
     content = path.read_text()
 
-    # Find ## Links and append after it
+    entry = body.strip()
+    if not entry.startswith("-"):
+        entry = f"- {entry}"
+
     if "## Links" in content:
         idx = content.index("## Links")
         end_of_line = content.index("\n", idx)
-        # Find the next ## section or end of file
         next_section = content.find("\n## ", end_of_line + 1)
-        if next_section == -1:
-            insert_at = len(content)
-        else:
-            insert_at = next_section
-
-        entry = body.strip()
-        if not entry.startswith("-"):
-            entry = f"- {entry}"
+        insert_at = len(content) if next_section == -1 else next_section
         content = content[:insert_at].rstrip() + "\n" + entry + "\n" + content[insert_at:]
-        path.write_text(content)
     else:
-        # No Links section — append one
-        entry = body.strip()
-        if not entry.startswith("-"):
-            entry = f"- {entry}"
         content = content.rstrip() + "\n\n## Links\n\n" + entry + "\n"
-        path.write_text(content)
+    path.write_text(content)
 
 
 def route_todo(classification: dict, dt: datetime) -> None:
@@ -256,7 +239,7 @@ Resolve absolute references ("tomorrow", "thursday", "3pm") using the current ti
     try:
         result = subprocess.run(
             [
-                "/Users/mannatvjain/.local/bin/claude", "-p",
+                "/Users/mannat/.local/bin/claude", "-p",
                 "--model", "haiku",
                 "--output-format", "json",
                 "--json-schema", schema,
@@ -275,38 +258,81 @@ Resolve absolute references ("tomorrow", "thursday", "3pm") using the current ti
         return None
 
 
+def extract_reminder_fire_at(body: str) -> tuple[str, str] | None:
+    """Extract (cleaned, fire_at) from a reminder body. Returns None if no time can be parsed."""
+    now = datetime.now().astimezone()
+    prompt = f"""Current time: {now.isoformat()}
+Timezone: America/New_York
+
+The user wants to set a reminder: {body.strip()}
+
+Extract:
+- "cleaned": a short description of what to be reminded about
+- "fire_at": the absolute ISO 8601 datetime with timezone offset (e.g. "2026-05-25T13:00:00-04:00"). Resolve relative references ("tomorrow", "thursday", "in 2 hours", "tonight") using the current time above.
+
+If no time is mentioned, return null for fire_at."""
+
+    schema = json.dumps({
+        "type": "object",
+        "properties": {
+            "cleaned": {"type": "string"},
+            "fire_at": {"type": ["string", "null"]},
+        },
+        "required": ["cleaned"],
+    })
+
+    try:
+        result = subprocess.run(
+            [
+                "/Users/mannat/.local/bin/claude", "-p",
+                "--model", "haiku",
+                "--output-format", "json",
+                "--json-schema", schema,
+                "--system-prompt", "You are a reminder time extractor. Return only the requested JSON.",
+                "--allowedTools", "",
+            ],
+            input=prompt,
+            capture_output=True, text=True, timeout=30,
+        )
+        parsed = json.loads(result.stdout.strip())
+        parsed = parsed.get("structured_output", parsed)
+        fire_at = parsed.get("fire_at")
+        cleaned = parsed.get("cleaned") or body.strip()
+        if not fire_at:
+            return None
+        datetime.fromisoformat(fire_at)
+        return cleaned, fire_at
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
 def _route_to_category(body: str, category: str, dt: datetime, classification: dict | None = None, signal_timestamp: int = 0) -> None:
-    """Route a message body to a specific category."""
+    """Route a message body to one of the supported categories."""
     if category == "reminder":
         fire_at = (classification or {}).get("fire_at")
         cleaned = (classification or {}).get("cleaned", body)
         if fire_at:
             route_reminder(cleaned, fire_at, signal_timestamp)
         else:
-            # No fire_at — re-classify needed, fall through to todo
             print("Reminder without fire_at, routing as todo", flush=True)
             cls = {"cleaned": cleaned, "context": None, "original": body}
             route_todo(cls, dt)
-    elif category == "resource":
-        route_resource(body, dt)
     elif category == "todo":
         cls = classification or {"cleaned": body, "context": None, "original": body}
         route_todo(cls, dt)
-    elif category in TARGETS and TARGETS[category]:
-        target = TARGETS[category]
+    elif category == "resource":
+        route_resource(body, dt)
+    else:
+        # sundry — and fallback for any unexpected category
+        target = TARGETS["sundry"]
         entry = body.strip()
         if not entry.startswith("-"):
             entry = f"- {entry}"
         append_to_file(target, entry)
-    else:
-        entry = body.strip()
-        if not entry.startswith("-"):
-            entry = f"- {entry}"
-        append_to_file(TARGETS["sundry"], entry)
 
 
 def _remove_from_category(body: str, category: str, dt: datetime) -> bool:
-    """Remove a message from its current category location. Returns True if found and removed."""
+    """Remove a message from its current category location."""
     if category == "reminder":
         return remove_reminder(body)
 
@@ -321,9 +347,8 @@ def _remove_from_category(body: str, category: str, dt: datetime) -> bool:
         path = get_daily_note_path(dt)
         if not path.exists():
             return False
-        content = path.read_text()
 
-        lines = content.split("\n")
+        lines = path.read_text().split("\n")
         new_lines = []
         removed = False
 
@@ -336,42 +361,72 @@ def _remove_from_category(body: str, category: str, dt: datetime) -> bool:
         if removed:
             path.write_text("\n".join(new_lines))
             return True
+        return False
 
-    elif category in TARGETS and TARGETS[category]:
-        target = TARGETS[category]
-        if not target.exists():
-            return False
-        content = target.read_text()
+    target = TARGETS.get(category)
+    if not target or not target.exists():
+        return False
 
-        lines = content.split("\n")
-        new_lines = []
-        removed = False
+    lines = target.read_text().split("\n")
+    new_lines = []
+    removed = False
+    for line in lines:
+        if not removed and body_stripped in line:
+            removed = True
+            continue
+        new_lines.append(line)
 
-        for line in lines:
-            if not removed and body_stripped in line:
-                removed = True
-                continue
-            new_lines.append(line)
-
-        if removed:
-            # Clean up double blank lines
-            cleaned = "\n".join(new_lines)
-            while "\n\n\n" in cleaned:
-                cleaned = cleaned.replace("\n\n\n", "\n\n")
-            target.write_text(cleaned)
-            return True
-
+    if removed:
+        cleaned = "\n".join(new_lines)
+        while "\n\n\n" in cleaned:
+            cleaned = cleaned.replace("\n\n\n", "\n\n")
+        target.write_text(cleaned)
+        return True
     return False
 
 
 def route_message(body: str, signal_timestamp: int) -> str | None:
-    """Classify and route a non-card message. Returns the category or None."""
+    """Classify and route a non-card message. Returns the category label or None."""
+    body_stripped = body.strip()
+    lower = body_stripped.lower()
+    dt = datetime.fromtimestamp(signal_timestamp / 1000)
+
+    # Short-circuit: `todo:` prefix skips classification and goes straight to Notion.
+    if lower.startswith("todo:"):
+        cleaned = body_stripped[5:].strip()
+        if not cleaned:
+            return None
+        notion.send_or_queue(cleaned, None)
+        print("Routed to todo (short-circuit)", flush=True)
+        return "todo"
+
+    # Short-circuit: `reminder:` prefix skips classification and asks Claude only
+    # for the fire_at time. Falls back to todo if no valid time can be extracted.
+    if lower.startswith("reminder:"):
+        cleaned = body_stripped[9:].strip()
+        if not cleaned:
+            return None
+        result = extract_reminder_fire_at(cleaned)
+        if result:
+            reminder_body, fire_at = result
+            route_reminder(reminder_body, fire_at, signal_timestamp)
+            try:
+                fire_dt = datetime.fromisoformat(fire_at)
+                time_str = fire_dt.strftime("%-I:%M %p")
+                print(f"Routed to reminder @ {time_str} (short-circuit)", flush=True)
+                return f"reminder @ {time_str}"
+            except (ValueError, TypeError):
+                print("Routed to reminder (short-circuit)", flush=True)
+                return "reminder"
+        print("Reminder short-circuit: no valid time, routing as todo", flush=True)
+        notion.send_or_queue(cleaned, None)
+        return "todo"
+
     classification = classify_message(body)
     if not classification:
         return None
 
     category = classification.get("category", "sundry")
-    dt = datetime.fromtimestamp(signal_timestamp / 1000)
 
     _route_to_category(body, category, dt, classification, signal_timestamp)
 
@@ -385,9 +440,9 @@ def route_message(body: str, signal_timestamp: int) -> str | None:
         except (ValueError, TypeError):
             print(f"Routed to reminder (no valid time)", flush=True)
             return "reminder"
-    else:
-        print(f"Routed to {category}", flush=True)
-        return category
+
+    print(f"Routed to {category}", flush=True)
+    return category
 
 
 def reroute_message(body: str, signal_timestamp: int, old_category: str, new_category: str) -> bool:
