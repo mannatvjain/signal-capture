@@ -14,6 +14,7 @@ from pathlib import Path
 
 from signal_capture.capture import DB_PATH
 from signal_capture.cards import get_daily_note_path, ensure_daily_note
+from signal_capture import notion
 
 VAULT_ROOT = Path.home() / "Documents" / "Obsidian Vaults" / "dot"
 SUNDRY = VAULT_ROOT / "4-Sundry"
@@ -141,46 +142,10 @@ def route_resource(body: str, dt: datetime) -> None:
 
 
 def route_todo(classification: dict, dt: datetime) -> None:
-    """Add a todo to the daily note's ### Todo section."""
-    path = get_daily_note_path(dt)
-    ensure_daily_note(path, dt)
-    content = path.read_text()
-
-    cleaned = classification.get("cleaned", classification.get("original", ""))
+    """Send a todo to the Notion "In" database. Queues for retry on failure."""
+    cleaned = classification.get("cleaned") or classification.get("original", "")
     context = classification.get("context")
-
-    entry = f"- [ ] {cleaned}"
-    if context:
-        entry += f"\n    - {context}"
-
-    if "### Todo" in content:
-        idx = content.index("### Todo")
-        end_of_line = content.index("\n", idx)
-        # Find next ### or ## section
-        next_section_h3 = content.find("\n### ", end_of_line + 1)
-        next_section_h2 = content.find("\n## ", end_of_line + 1)
-        candidates = [x for x in [next_section_h3, next_section_h2] if x != -1]
-        insert_at = min(candidates) if candidates else len(content)
-
-        content = content[:insert_at].rstrip() + "\n" + entry + "\n" + content[insert_at:]
-        path.write_text(content)
-    else:
-        # Create ### Todo after ## Links (or after frontmatter)
-        if "## Links" in content:
-            idx = content.index("## Links")
-            end_of_line = content.index("\n", idx)
-            # Insert Todo section right after Links section content
-            next_section = content.find("\n## ", end_of_line + 1)
-            if next_section == -1:
-                insert_at = len(content)
-            else:
-                insert_at = next_section
-
-            todo_block = f"\n\n### Todo\n\n{entry}\n"
-            content = content[:insert_at].rstrip() + todo_block + content[insert_at:]
-        else:
-            content = content.rstrip() + "\n\n### Todo\n\n" + entry + "\n"
-        path.write_text(content)
+    notion.send_or_queue(cleaned, context)
 
 
 def route_reminder(body: str, fire_at: str, signal_timestamp: int) -> bool:
@@ -347,29 +312,25 @@ def _remove_from_category(body: str, category: str, dt: datetime) -> bool:
 
     body_stripped = body.strip()
 
-    if category in ("resource", "todo"):
+    if category == "todo":
+        # Todos live in Notion now. Best we can do is dequeue if still pending.
+        # If already sent, the user must delete from Notion manually.
+        return notion.dequeue_by_name(body_stripped)
+
+    if category == "resource":
         path = get_daily_note_path(dt)
         if not path.exists():
             return False
         content = path.read_text()
 
-        # For todos, the cleaned version may differ from body — search for body substring
-        # For resources, search for the body text
         lines = content.split("\n")
         new_lines = []
         removed = False
-        skip_context = False
 
-        for i, line in enumerate(lines):
+        for line in lines:
             if not removed and body_stripped in line:
                 removed = True
-                skip_context = True
                 continue
-            # Skip indented context lines belonging to a removed todo
-            if skip_context and line.startswith("    - "):
-                skip_context = False
-                continue
-            skip_context = False
             new_lines.append(line)
 
         if removed:

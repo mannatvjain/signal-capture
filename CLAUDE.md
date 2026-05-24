@@ -38,7 +38,7 @@ Signal "Note to Self" → signal-cli daemon → SQLite database
 |---|---|
 | card | Daily note `## Signal` + `anki-sync` |
 | resource | Daily note `## Links` |
-| todo | Daily note `### Todo` (cleaned up by Claude) |
+| todo | Notion "In" database (via `signal_capture.notion`; queued + retried on failure) |
 | good-advice | `4-Sundry/A list of good advice.md` |
 | founders | `4-Sundry/Founders.md` |
 | deltas | `4-Sundry/Running Deltas.md` |

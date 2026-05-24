@@ -101,6 +101,17 @@ def init_db() -> sqlite3.Connection:
     msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()}
     if "obsidian_synced" not in msg_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN obsidian_synced INTEGER")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notion_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            context TEXT,
+            created_at TEXT NOT NULL,
+            last_attempt_at TEXT,
+            last_error TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0
+        )
+    """)
     conn.commit()
     return conn
 

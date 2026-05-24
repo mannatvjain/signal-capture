@@ -11,6 +11,8 @@ import re
 import socket
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from signal_capture.triage import (
     route_message, reroute_message,
     cancel_reminder_by_timestamp, reschedule_reminder_by_timestamp, parse_reschedule_time,
 )
+from signal_capture import notion
 
 SOCKET_PATH = Path.home() / ".signal-capture.socket"
 
@@ -323,6 +326,17 @@ def run_daemon():
     )
 
     print("Daemon running. Waiting for messages...", flush=True)
+
+    def _notion_drainer():
+        """Periodically drain any queued Notion todos that previously failed."""
+        while True:
+            time.sleep(60)
+            try:
+                notion.drain_queue()
+            except Exception as e:
+                print(f"Notion drain error: {e}", flush=True)
+
+    threading.Thread(target=_notion_drainer, daemon=True).start()
 
     try:
         for line in proc.stdout:

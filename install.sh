@@ -10,6 +10,13 @@ if [ -z "$SL_BIN" ]; then
     exit 1
 fi
 
+if [ -z "$NOTION_TOKEN" ]; then
+    echo "Error: NOTION_TOKEN env var not set. Export it before running:"
+    echo "  export NOTION_TOKEN='ntn_...'"
+    echo "  ./install.sh"
+    exit 1
+fi
+
 # Unload old jobs if they exist
 launchctl unload "$PLIST_DIR/com.mannat.signal-capture.plist" 2>/dev/null
 launchctl unload "$PLIST_DIR/com.mannat.signal-capture-health.plist" 2>/dev/null
@@ -39,6 +46,11 @@ cat > "$PLIST_DIR/com.mannat.signal-capture.plist" <<EOF
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NOTION_TOKEN</key>
+        <string>${NOTION_TOKEN}</string>
+    </dict>
 </dict>
 </plist>
 EOF
