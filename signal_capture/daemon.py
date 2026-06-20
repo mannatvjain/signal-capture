@@ -29,7 +29,13 @@ from signal_capture.cards import (
     is_blot, process_blot, blot_text,
     is_salience, process_salience,
 )
-from signal_capture.meals import IMAGE_CONTENT_TYPES, estimate_calories, resolve_attachment
+from signal_capture.meals import (
+    IMAGE_CONTENT_TYPES,
+    estimate_calories,
+    format_breakdown,
+    log_meal,
+    resolve_attachment,
+)
 from signal_capture import notion
 
 SOCKET_PATH = Path.home() / ".signal-capture.socket"
@@ -381,7 +387,8 @@ def run_daemon():
                         _last_message_at = datetime.now()
 
                 # Photo + "meal" in caption → ask the model for a calorie breakdown,
-                # send the answer back through Summertime. Nothing saved or logged.
+                # persist it to running.db meal_log (+ copy the photo into Meals/),
+                # and send the answer back through Summertime.
                 attachments = entry.get("attachments") or []
                 images = [a for a in attachments if a.get("contentType") in IMAGE_CONTENT_TYPES]
                 if inserted and images and "meal" in body.lower():
@@ -389,8 +396,12 @@ def run_daemon():
                         path = resolve_attachment(att)
                         if not path:
                             continue
-                        breakdown = estimate_calories(path, body)
-                        send_alert(f"[meal]\n{breakdown}" if breakdown else "[meal] couldn't estimate")
+                        data = estimate_calories(path, body)
+                        if data:
+                            log_meal(path, body, data, att.get("contentType"))
+                            send_alert(f"[meal]\n{format_breakdown(data)}")
+                        else:
+                            send_alert("[meal] couldn't estimate")
                     HEALTH_FILE.write_text(datetime.now().isoformat())
                     continue
 
