@@ -8,6 +8,7 @@ database in the Obsidian vault, and sends a confirmation reply.
 Designed to run via launchd every 2 minutes.
 """
 
+import socket
 import subprocess
 import json
 import os
@@ -17,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 # --- Configuration ---
-VAULT_ROOT = Path.home() / "Documents" / "Obsidian Vaults" / "dot"
+VAULT_ROOT = Path.home() / "Documents" / "dot"
 DB_DIR = VAULT_ROOT / "CLAUDE" / "Artifacts" / "signal-capture"
 DB_PATH = DB_DIR / "capture.db"
 HEALTH_FILE = Path.home() / ".signal-capture-health"
@@ -40,26 +41,92 @@ if CONFIG_FILE.exists():
             ALERT_RECIPIENT = val
 
 
+SUMMERTIME_ALERT_SOCKET = Path.home() / ".summertime-alert.socket"
+
+
+def _recv_all(sock: socket.socket, timeout: float = 10) -> bytes:
+    """Read from socket until a full JSON response is received."""
+    sock.settimeout(timeout)
+    chunks = []
+    while True:
+        try:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            try:
+                json.loads(b"".join(chunks))
+                break
+            except json.JSONDecodeError:
+                continue
+        except socket.timeout:
+            break
+    return b"".join(chunks)
+
+
+def _send_via_socket(text: str, attachments: list[str] | None = None) -> int | None:
+    """Send via Summertime's alert daemon socket (preferred when Summertime is running)."""
+    if not SUMMERTIME_ALERT_SOCKET.exists():
+        return None
+    params = {
+        "account": ALERT_ACCOUNT,
+        "recipient": [ALERT_RECIPIENT],
+        "message": text,
+    }
+    if attachments:
+        params["attachments"] = attachments
+    request = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "send",
+        "params": params,
+    }) + "\n"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(SUMMERTIME_ALERT_SOCKET))
+        sock.sendall(request.encode())
+        data = _recv_all(sock)
+        resp = json.loads(data.decode())
+        result = resp.get("result", {})
+        return result.get("timestamp") or int(datetime.now().timestamp() * 1000)
+    except (ConnectionRefusedError, FileNotFoundError, TimeoutError, OSError) as e:
+        print(f"Socket send failed, falling back to subprocess: {e}", file=sys.stderr)
+        return None
+    except (json.JSONDecodeError, AttributeError):
+        return int(datetime.now().timestamp() * 1000)
+    finally:
+        sock.close()
+
+
 def send_alert(text: str, attachments: list[str] | None = None) -> int | None:
     """Send a push notification via the GV bot account.
 
+    Uses Summertime's alert socket when available (avoids signal-cli lock conflict),
+    falls back to direct subprocess.
+
     Returns the sent message's Signal timestamp (ms) on success, None on failure.
-    Truthy/falsy behavior is preserved for existing callers.
     """
     if not ALERT_ACCOUNT or not ALERT_RECIPIENT:
         print("Alert account not configured.", file=sys.stderr)
         return None
+
+    # Prefer socket (Summertime's daemon already holds the signal-cli lock)
+    result = _send_via_socket(text, attachments)
+    if result is not None:
+        return result
+
+    # Fallback: direct signal-cli subprocess
     try:
         cmd = [SIGNAL_CLI, "-a", ALERT_ACCOUNT, "--output=json", "send", "-m", text, ALERT_RECIPIENT]
         if attachments:
             for a in attachments:
                 cmd.extend(["--attachment", a])
-        result = subprocess.run(
+        proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0:
+        if proc.returncode == 0:
             try:
-                data = json.loads(result.stdout.strip().splitlines()[-1])
+                data = json.loads(proc.stdout.strip().splitlines()[-1])
                 return data.get("timestamp") or int(datetime.now().timestamp() * 1000)
             except (json.JSONDecodeError, IndexError):
                 return int(datetime.now().timestamp() * 1000)
@@ -72,7 +139,9 @@ def send_alert(text: str, attachments: list[str] | None = None) -> int | None:
 def init_db() -> sqlite3.Connection:
     """Initialize the database and return a connection."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
