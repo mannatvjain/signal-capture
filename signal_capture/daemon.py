@@ -28,6 +28,7 @@ from signal_capture.cards import (
     is_card, process_card,
     is_blot, process_blot, blot_text,
     is_salience, process_salience,
+    render_block, render_cards,
 )
 from signal_capture.meals import (
     IMAGE_CONTENT_TYPES,
@@ -282,7 +283,12 @@ def _flush_pending_sorted():
 
     if len(items) == 1:
         category, body = items[0]
-        send_message(f"[sorted] {category} — {body}")
+        # Block-rendered bodies (cards/salience START...END) go on their own
+        # line with no hyphen; single-line bodies keep the " — body" form.
+        if "\n" in body:
+            send_message(f"[sorted] {category}\n{body}")
+        else:
+            send_message(f"[sorted] {category} — {body}")
         return
 
     lines = [f"[sorted] {len(items)} captures"]
@@ -418,17 +424,18 @@ def run_daemon():
                         result = process_blot(body, entry["signal_timestamp"])
                         if result == "success":
                             blot_body = re.sub(r"^\[blot\]\s*", "", body.strip(), flags=re.IGNORECASE)
-                            blotted = blot_text(blot_body)
+                            confirmation = render_block("Basic", {"Front": blot_text(blot_body), "Back": blot_body})
                             with _pending_lock:
-                                _pending_sorted.append(("card", f"Q. {blotted}\nA. {blot_body}"))
+                                _pending_sorted.append(("card", confirmation))
                                 _last_message_at = datetime.now()
                         elif result == "sync_failed":
                             send_message("[vault] card queued (Anki sync pending)")
                     elif is_salience(body):
                         result = process_salience(body, entry["signal_timestamp"])
                         if result == "success":
+                            stripped = re.sub(r"^\[salience\]\s*", "", body.strip(), flags=re.IGNORECASE)
                             with _pending_lock:
-                                _pending_sorted.append(("salience", body))
+                                _pending_sorted.append(("salience", render_cards(stripped)))
                                 _last_message_at = datetime.now()
                         elif result == "sync_failed":
                             send_message("[vault] card queued (Anki sync pending)")
@@ -436,7 +443,7 @@ def run_daemon():
                         result = process_card(body, entry["signal_timestamp"])
                         if result == "success":
                             with _pending_lock:
-                                _pending_sorted.append(("card", body))
+                                _pending_sorted.append(("card", render_cards(body)))
                                 _last_message_at = datetime.now()
                         elif result == "sync_failed":
                             send_message("[vault] card queued (Anki sync pending)")

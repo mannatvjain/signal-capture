@@ -6,7 +6,7 @@ A Python daemon that pipes your Signal "Note to Self" messages into a local SQLi
 
 - **Note-to-Self pipeline** — Text yourself on Signal, messages land instantly via signal-cli's persistent daemon
 - **AI triage** — Claude Haiku (via `claude -p`) classifies each message and routes it
-- **Anki cards** — `Q. / A.` and `C. {cloze}` messages are written verbatim to the daily note; the obsidian-to-anki plugin syncs them to Anki + AnkiWeb
+- **Anki cards** — `Q. / A.` and `C. {cloze}` messages are parsed and re-emitted as `START`/`END` blocks (uniform, multi-line-safe) into the daily note; the obsidian-to-anki plugin syncs them to Anki + AnkiWeb
 - **Notion todos** — Todo messages post to a Notion "In" database; failures queue locally and retry every 60s
 - **Reminders** — Time-bound messages get an ISO 8601 `fire_at` and land in the reminders table for [Summertime](../summertime) to fire
 - **Prefix short-circuits** — Skip the classifier with `todo:` or `reminder:` prefixes
@@ -98,7 +98,7 @@ sl health        # Pipeline health check
 | Shape / category | Destination |
 |---|---|
 | Image + body contains "meal" | Claude vision estimates itemized calories; result sent back via Summertime as `[meal] ...`. No image saved, no DB writes. |
-| `card` (Q.A. / C.{cloze} / [blot] / [salience]) | Daily note `## Signal` + `anki-sync` |
+| `card` (Q.A. / C.{cloze} / [blot] / [salience]) | Daily note `## Signal` as `START`/`END` block + `anki-sync` |
 | `reminder` | `capture.db` reminders table — fired by Summertime |
 | `todo` | Notion "In" database (queued + retried on failure) |
 | `resource` | Daily note `## Links` |
@@ -106,14 +106,21 @@ sl health        # Pipeline health check
 
 ### Cards
 
-Card-shaped messages bypass the classifier and are written **verbatim** to today's daily note under `## Signal` — the obsidian-to-anki plugin parses them directly. Recognized formats:
+Card-shaped messages bypass the classifier. Signal-capture parses the input, then writes a **uniform `START`/`END` block** to today's daily note under `## Signal` — the obsidian-to-anki plugin then syncs to Anki. Block form is used for every card (single- or multi-line) because it's the only format that safely preserves blank lines inside fields.
 
-| Input | Output |
+Recognized inputs:
+
+| Input | Emitted as |
 |---|---|
-| `Q. front\nA. back` (or single line) | Basic card |
-| `C. The capital of France is {Paris}` | Cloze (auto-numbered `{{c1::Paris}}`; multiple `{x}` become c1/c2/c3) |
-| `[blot] she ran the mile` | Auto-generated `Q. s.. r.. t.. m...\nA. she ran the mile` |
-| `[salience] Q. ... A. ...` | Written to `CLAUDE/Running Salience.md` instead of the daily note |
+| `Q. front A. back` (single line) | `START\nBasic\nfront\nBack: back\nEND` |
+| `Q. front\nA. back` | same as above |
+| Multi-line `Q. ...\n...\nA. ...\n...` | `START`/`Basic` block with both fields preserved across lines |
+| `C. text with {1:cloze}` | `START\nCloze\ntext with {1:cloze}\nEND` |
+| `[blot] she ran the mile` | `START\nBasic\ns.. r.. t.. m...\nBack: she ran the mile\nEND` |
+| `[blot]` with multi-line body | each line is blotted independently; newlines preserved in both fields |
+| `[salience] <card>` | parsed + re-emitted as `START`/`END`, written to `CLAUDE/Running Salience.md` instead of the daily note |
+
+Cloze braces stay as `{N:text}` — the plugin's `CurlyCloze` setting converts to Anki's `{{cN::text}}` at sync time.
 
 After writing, `anki-sync` runs (debounced 10s) and triggers the obsidian-to-anki plugin's vault scan → AnkiConnect → AnkiWeb.
 

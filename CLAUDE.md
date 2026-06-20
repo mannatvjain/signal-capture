@@ -40,7 +40,7 @@ debounced [sorted] confirmation back to Signal
 - `cli.py` — `sl` entry point. Subcommands: `poll`, `daemon`, `view`, `list`, `count`, `health`
 - `capture.py` — Config, `.env` loading, `init_db` (messages + reminders + notion_queue tables + migrations), `send_alert` (prefers Summertime socket, falls back to signal-cli subprocess), one-shot `poll` plumbing
 - `daemon.py` — Persistent daemon. Runs signal-cli over Unix socket, three background threads (health writer, [sorted] debounce flusher, Notion drainer), `handle_correction` for reply-based corrections
-- `cards.py` — Card detection (`Q. A.` / `C.{cloze}` / `[blot]` / `[salience]`), daily-note appending (raw, no envelope), `anki-sync` script invocation (debounced 10s)
+- `cards.py` — Card detection (`Q. A.` / `C.{cloze}` / `[blot]` / `[salience]`), parse + render to `START`/`END` block form (`_parse_card`, `_render_block`, `render_cards`), daily-note appending, `anki-sync` script invocation (debounced 10s)
 - `triage.py` — Claude classifier + routing. `todo:` and `reminder:` prefix short-circuits, `_remove_from_category` for reroute cleanup, `parse_reschedule_time` and `extract_reminder_fire_at` Claude helpers
 - `notion.py` — Notion REST client. `send_or_queue` posts to the In database; `drain_queue` retries; `dequeue_by_name` for reroute cleanup
 - `viewer.py` — Textual TUI (vim keys: j/k, /, g/G, q)
@@ -69,16 +69,27 @@ The classifier prompt + JSON schema enumerate exactly these four (`triage.py:54-
 Card-shaped messages bypass the classifier entirely. Detection happens in `cards.is_card` (regex match on `Q.`/`A.`/`C.{cloze}`). Once detected:
 
 1. `anki_pre_sync()` runs `~/Documents/dot/CLAUDE/Artifacts/anki-sync --sync-only` (pulls AnkiWeb → local Anki). Blocking, 60s timeout.
-2. Card text is written **verbatim** (no `START/END` envelope) to today's daily note under `## Signal`.
-3. `trigger_anki_sync()` schedules a debounced (10s) `anki-sync` run that:
+2. `render_cards(body)` parses each block via `_parse_card` (returns `(note_type, fields)`) and re-emits each as a `START`/`END` block via `_render_block`. This is uniform — single-line and multi-line cards both become block form. Reason: shorthand `Q.`/`A.` and `C.` cannot represent blank lines inside a field, which breaks multi-line answers (the plugin's per-line regex stops at the first `\s*$`). `START`/`END` is the only delimiter the plugin parses that tolerates arbitrary intra-field content.
+3. Block-rendered text is appended to today's daily note under `## Signal`.
+4. `trigger_anki_sync()` schedules a debounced (10s) `anki-sync` run that:
    - Triggers the obsidian-to-anki plugin's `anki-scan-vault` via `obsidian://advanced-uri`
    - Calls AnkiConnect `sync` to push to AnkiWeb
 
 The obsidian-to-anki plugin is what actually creates the Anki notes — signal-capture never calls AnkiConnect directly.
 
+**Block format emitted:**
+```
+START
+Basic              # or Cloze
+<first field content, possibly multi-line>
+Back: <next field content, possibly multi-line>   # Basic only — Cloze has one field
+END
+```
+First line after `START` is the note type. Subsequent lines accumulate into the current field; a line starting with `FieldName:` switches to that field. Plugin source: `main.js:604-652` (`Note` class).
+
 **Variants:**
-- `[blot] some sentence` → synthesizes `Q. {blotted}\nA. {original}` and writes to daily note
-- `[salience] Q. ... A. ...` → writes raw card text to `CLAUDE/Running Salience.md` instead of the daily note
+- `[blot] <body>` → blots each line independently (`blot_text` is newline-aware), then emits `_render_block("Basic", {Front: blotted, Back: stripped})`. Multi-line blot preserves the line structure in both fields.
+- `[salience] <card>` → parses and re-emits via `render_cards`, writes to `CLAUDE/Running Salience.md` instead of the daily note.
 
 ### Prefix short-circuits (skip the classifier)
 Implemented at the top of `route_message` (`triage.py:388`):
@@ -101,6 +112,7 @@ Example for 2026-05-24: `0-Journal/1-2026/1-May/05-24.md` (May = month 1 since t
 The daemon talks back via Signal. Two-stage:
 1. `[vault] captured.` — DB insert confirmed (sent immediately on insert)
 2. `[sorted] <category> — <body>` — classification + routing confirmed (debounced 8s; if multiple captures arrive in a burst, they're batched into one `[sorted] N captures` message)
+   - When `<body>` is a multi-line block (the `START…END` form that `card`/`salience` render to), the single-capture confirmation drops the ` — ` and puts the block on its own line: `[sorted] card\nSTART…END`. Single-line bodies keep the ` — body` form. Keyed on a newline in the body (`_flush_pending_sorted`, `daemon.py`), so it covers cards and salience without naming categories. The batched `[sorted] N captures` path still inlines bodies as `— <category>: <body>`.
 
 Other confirmation types:
 - `[rerouted] <old> → <new> — <body>` — reply-based reroute applied

@@ -131,33 +131,82 @@ def _fire_anki_sync() -> None:
         pass  # anki-sync not installed, skip silently
 
 
-def blot_text(text: str) -> str:
-    """Transform text so each word shows only its first letter, rest as dots.
-
-    Preserves punctuation at word boundaries, capitalization, and numbers.
-    Words are split on spaces only. Hyphenated words and contractions are one unit.
-    """
+def _blot_line(text: str) -> str:
     words = text.split(" ")
     result = []
     for word in words:
         if not word:
             result.append(word)
             continue
-        # Find leading letter/digit content and trailing punctuation
-        # Strip trailing punctuation to handle "study;" -> "s....;"
         trail = ""
         core = word
         while core and core[-1] in ".,;:!?)\"'":
             trail = core[-1] + trail
             core = core[:-1]
         if not core:
-            # Entirely punctuation
             result.append(word)
         elif len(core) == 1:
             result.append(core + trail)
         else:
             result.append(core[0] + "." * (len(core) - 1) + trail)
     return " ".join(result)
+
+
+def blot_text(text: str) -> str:
+    """Transform text so each word shows only its first letter, rest as dots.
+
+    Preserves punctuation at word boundaries, capitalization, and numbers.
+    Words are split on spaces only. Hyphenated words and contractions are one unit.
+    Newlines are preserved — each line is blotted independently.
+    """
+    return "\n".join(_blot_line(line) for line in text.split("\n"))
+
+
+def _parse_card(block: str) -> tuple[str, dict[str, str]] | None:
+    """Parse a single card block into (note_type, fields). Returns None if not a card."""
+    block = block.strip()
+    if not block:
+        return None
+    if CLOZE_PATTERN.match(block):
+        text = re.sub(r"^C\.\s+", "", block, count=1)
+        return ("Cloze", {"Text": text})
+    m = QA_SINGLE_LINE.match(block)
+    if m:
+        return ("Basic", {"Front": m.group(1).strip(), "Back": m.group(2).strip()})
+    if QA_MULTI_LINE.match(block) and re.search(r"^A\.\s+", block, re.MULTILINE):
+        front_match = re.match(r"^Q\.\s+(.*?)(?=^A\.\s+)", block, re.DOTALL | re.MULTILINE)
+        back_match = re.search(r"^A\.\s+(.+)$", block, re.DOTALL | re.MULTILINE)
+        if front_match and back_match:
+            return ("Basic", {"Front": front_match.group(1).strip(), "Back": back_match.group(1).strip()})
+    return None
+
+
+def render_block(note_type: str, fields: dict[str, str]) -> str:
+    """Emit a START/END block. First field is anonymous; subsequent fields are 'Name: ...' prefixed."""
+    lines = ["START", note_type]
+    for i, (name, value) in enumerate(fields.items()):
+        value_lines = value.split("\n")
+        if i == 0:
+            lines.extend(value_lines)
+        else:
+            lines.append(f"{name}: {value_lines[0]}")
+            lines.extend(value_lines[1:])
+    lines.append("END")
+    return "\n".join(lines)
+
+
+def render_cards(body: str) -> str:
+    """Render a (possibly multi-card) message as START/END blocks. Non-card blocks pass through."""
+    blocks = _split_blocks(body)
+    rendered = []
+    for block in blocks:
+        parsed = _parse_card(block)
+        if parsed is None:
+            rendered.append(block)
+        else:
+            note_type, fields = parsed
+            rendered.append(render_block(note_type, fields))
+    return "\n\n".join(rendered)
 
 
 def is_blot(body: str) -> bool:
@@ -175,7 +224,7 @@ def process_blot(body: str, signal_timestamp: int) -> str:
         print("Pre-sync failed, deferring blot card", flush=True)
         return "sync_failed"
 
-    card_text = f"Q. {blot_text(stripped)}\nA. {stripped}"
+    card_text = render_block("Basic", {"Front": blot_text(stripped), "Back": stripped})
 
     dt = datetime.fromtimestamp(signal_timestamp / 1000)
     path = append_card_to_daily_note(card_text, dt)
@@ -200,7 +249,7 @@ def process_salience(body: str, signal_timestamp: int) -> str:
         return "sync_failed"
 
     content = SALIENCE_PATH.read_text() if SALIENCE_PATH.exists() else ""
-    content = content.rstrip() + "\n\n" + stripped + "\n"
+    content = content.rstrip() + "\n\n" + render_cards(stripped) + "\n"
     SALIENCE_PATH.write_text(content)
     print(f"Salience prompt appended to {SALIENCE_PATH.name}", flush=True)
     trigger_anki_sync()
@@ -217,7 +266,7 @@ def process_card(body: str, signal_timestamp: int) -> str:
         return "sync_failed"
 
     dt = datetime.fromtimestamp(signal_timestamp / 1000)
-    path = append_card_to_daily_note(body.strip(), dt)
+    path = append_card_to_daily_note(render_cards(body), dt)
     print(f"Card appended to {path.name}", flush=True)
 
     trigger_anki_sync()
