@@ -21,7 +21,6 @@ from textual.widgets import DataTable, Footer, Header, Input, Label, Static
 DB_PATH = (
     Path.home()
     / "Documents"
-    / "Obsidian Vaults"
     / "dot"
     / "CLAUDE"
     / "Artifacts"
