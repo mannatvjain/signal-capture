@@ -32,9 +32,13 @@ from signal_capture.cards import (
 )
 from signal_capture.meals import (
     IMAGE_CONTENT_TYPES,
+    before_batch_time,
     estimate_calories,
     format_breakdown,
     log_meal,
+    pending_meals_due,
+    queue_meal,
+    process_pending_meals,
     resolve_attachment,
 )
 from signal_capture import notion
@@ -311,6 +315,27 @@ def _debounce_flusher():
             _flush_pending_sorted()
 
 
+def _meal_batch_processor():
+    """Background thread: estimate queued meals once the 8:30 PM window opens.
+
+    Polls the wall clock every minute instead of one long sleep — time.sleep
+    doesn't advance while the Mac sleeps, so a single sleep-until-8:30 fires
+    hours late after any lid-closed stretch. The due check also covers rows
+    queued on a previous day, so a daemon that was down at batch time catches
+    up on the next poll rather than waiting for the following 8:30 PM.
+    """
+    while True:
+        try:
+            if pending_meals_due():
+                print("Running meal batch estimation...", flush=True)
+                n = process_pending_meals(send_alert)
+                if n:
+                    print(f"Batch estimated {n} queued meal(s)", flush=True)
+        except Exception as e:
+            print(f"Meal batch error: {e}", flush=True)
+        time.sleep(60)
+
+
 def run_daemon():
     """Run signal-cli daemon and process messages as they stream in."""
     global _last_message_at
@@ -356,6 +381,7 @@ def run_daemon():
     threading.Thread(target=_health_writer, daemon=True).start()
     threading.Thread(target=_debounce_flusher, daemon=True).start()
     threading.Thread(target=_notion_drainer, daemon=True).start()
+    threading.Thread(target=_meal_batch_processor, daemon=True).start()
 
     try:
         for line in proc.stdout:
@@ -377,9 +403,22 @@ def run_daemon():
                 HEALTH_FILE.write_text(datetime.now().isoformat())
                 continue
 
-            # Skip our own confirmation messages
             body = entry["body"]
-            if body.startswith(("[vault]", "[sorted]", "[rerouted]", "[cancelled]", "[rescheduled]", "[error]", "[meal]", "[photo]")):
+            blow = body.lower()
+
+            # A photo with a meal caption — "[meal]" or a meal word (breakfast/
+            # lunch/dinner/snack) — is a user meal command, not one of our own
+            # replies. Route it to the calorie pipeline. Detect it up front so the
+            # confirmation filter below doesn't swallow it (it shares the "[meal]"
+            # prefix our own meal replies use). The meal word also sets meal_type.
+            attachments = entry.get("attachments") or []
+            images = [a for a in attachments if a.get("contentType") in IMAGE_CONTENT_TYPES]
+            is_meal_photo = bool(images) and (
+                "[meal]" in blow or any(w in blow for w in ("breakfast", "lunch", "dinner", "snack"))
+            )
+
+            # Skip our own confirmation messages (but never a "[meal]" + photo).
+            if not is_meal_photo and body.startswith(("[vault]", "[sorted]", "[rerouted]", "[cancelled]", "[rescheduled]", "[error]", "[meal]", "[photo]")):
                 continue
 
             try:
@@ -392,22 +431,29 @@ def run_daemon():
                     with _pending_lock:
                         _last_message_at = datetime.now()
 
-                # Photo + "meal" in caption → ask the model for a calorie breakdown,
-                # persist it to running.db meal_log (+ copy the photo into Meals/),
-                # and send the answer back through Summertime.
-                attachments = entry.get("attachments") or []
-                images = [a for a in attachments if a.get("contentType") in IMAGE_CONTENT_TYPES]
-                if inserted and images and "meal" in body.lower():
-                    for att in images:
-                        path = resolve_attachment(att)
-                        if not path:
-                            continue
-                        data = estimate_calories(path, body)
-                        if data:
-                            log_meal(path, body, data, att.get("contentType"))
-                            send_alert(f"[meal]\n{format_breakdown(data)}")
-                        else:
-                            send_alert("[meal] couldn't estimate")
+                # "[meal]" caption + photo → before 8:30 PM: copy + queue, confirm
+                # receipt only. At/after 8:30 PM: estimate immediately as before.
+                if inserted and is_meal_photo:
+                    if before_batch_time():
+                        queued = 0
+                        for att in images:
+                            path = resolve_attachment(att)
+                            if not path:
+                                continue
+                            if queue_meal(path, body, att.get("contentType")):
+                                queued += 1
+                        send_alert("[meal] received" if queued else "[error] meal photo couldn't be queued")
+                    else:
+                        for att in images:
+                            path = resolve_attachment(att)
+                            if not path:
+                                continue
+                            data = estimate_calories(path, body)
+                            if data:
+                                log_meal(path, body, data, att.get("contentType"))
+                                send_alert(f"[meal]\n{format_breakdown(data)}")
+                            else:
+                                send_alert("[meal] couldn't estimate")
                     HEALTH_FILE.write_text(datetime.now().isoformat())
                     continue
 

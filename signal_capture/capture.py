@@ -181,6 +181,20 @@ def init_db() -> sqlite3.Connection:
             attempts INTEGER NOT NULL DEFAULT 0
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meal_pending (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            image_name TEXT NOT NULL,
+            caption TEXT NOT NULL DEFAULT '',
+            content_type TEXT,
+            queued_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    # Migration: add attempts column for estimate retry tracking
+    mp_cols = {r[1] for r in conn.execute("PRAGMA table_info(meal_pending)").fetchall()}
+    if "attempts" not in mp_cols:
+        conn.execute("ALTER TABLE meal_pending ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 

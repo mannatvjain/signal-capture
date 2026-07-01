@@ -39,13 +39,13 @@ debounced [sorted] confirmation back to Signal
 ### Package (`signal_capture/`)
 - `cli.py` — `sl` entry point. Subcommands: `poll`, `daemon`, `view`, `list`, `count`, `health`
 - `capture.py` — Config, `.env` loading, `init_db` (messages + reminders + notion_queue tables + migrations), `send_alert` (prefers Summertime socket, falls back to signal-cli subprocess), one-shot `poll` plumbing
-- `daemon.py` — Persistent daemon. Runs signal-cli over Unix socket, three background threads (health writer, [sorted] debounce flusher, Notion drainer), `handle_correction` for reply-based corrections
+- `daemon.py` — Persistent daemon. Runs signal-cli over Unix socket, four background threads (health writer, [sorted] debounce flusher, Notion drainer, meal batch processor), `handle_correction` for reply-based corrections
 - `cards.py` — Card detection (`Q. A.` / `C.{cloze}` / `[blot]` / `[salience]`), parse + render to `START`/`END` block form (`_parse_card`, `_render_block`, `render_cards`), daily-note appending, `anki-sync` script invocation (debounced 10s)
 - `triage.py` — Claude classifier + routing. `todo:` and `reminder:` prefix short-circuits, `_remove_from_category` for reroute cleanup, `parse_reschedule_time` and `extract_reminder_fire_at` Claude helpers
 - `notion.py` — Notion REST client. `send_or_queue` posts to the In database; `drain_queue` retries; `dequeue_by_name` for reroute cleanup
 - `viewer.py` — Textual TUI (vim keys: j/k, /, g/G, q)
 - `health.py` — Standalone staleness check; macOS notification if `~/.signal-capture-health` is >1hr old
-- `meals.py` — Minimal calorie estimator. `estimate_calories(image_path, caption)` calls Claude Haiku vision and returns formatted text like `~650 kcal\n  • grilled chicken: ~250 kcal\n  • rice: ~200 kcal`. Nothing saved to disk or DB.
+- `meals.py` — Calorie + macro estimator with 8:30 PM batching. Before 8:30 PM, `queue_meal` copies the photo to `Running/Meals/` and inserts into capture.db `meal_pending`; `process_pending_meals` (driven by the daemon's batch thread once `pending_meals_due()`) runs `estimate_calories` — Claude Haiku vision, gluten-free aware, returns `{items, total, protein_g, carbs_g, fat_g}` — and logs each row. After 8:30 PM, `estimate_calories` + `log_meal` run immediately. Both paths persist to running.db `meal_log` and `mirror_food_to_minutely` upserts the day's kcal+macros into minutely's `food_days` (the Sheet's read-only Food column); `format_breakdown` renders the Signal text.
 
 ### Database
 - Location: `~/Documents/dot/CLAUDE/Artifacts/signal-capture/capture.db`
@@ -53,6 +53,7 @@ debounced [sorted] confirmation back to Signal
   - `messages (id, signal_timestamp UNIQUE, body, captured_at, obsidian_synced)`
   - `reminders (id, body, fire_at, signal_timestamp, created_at, fired, cancelled)`
   - `notion_queue (id, name, context, created_at, last_attempt_at, last_error, attempts)`
+  - `meal_pending (id, image_name, caption, content_type, queued_at, attempts)` — photos waiting for the 8:30 PM estimation batch
 - All messages land here first; vault files and Notion are routing destinations, not source of truth
 
 ### Categories (active classifier output)
@@ -142,17 +143,19 @@ The correction handler (`daemon.py:145`) parses the quoted text to recover the o
 ### send_alert socket behavior
 `send_alert()` in `capture.py` prefers Summertime's Unix socket (`~/.summertime-alert.socket`) over a direct `signal-cli send` subprocess. This avoids signal-cli account lock conflicts: Summertime's daemon already runs `signal-cli daemon` on the alert account, so a parallel subprocess would block on the account lock. If the socket isn't there (Summertime not running), it falls back to subprocess.
 
-### Image attachments
-**Trigger:** message has at least one image attachment AND the body contains the word "meal" (case-insensitive, substring match). Anything else with an image is ignored.
+### Image attachments (meal logging)
+**Trigger:** message has at least one image attachment AND the body contains `[meal]` or a meal word — `breakfast` / `lunch` / `dinner` / `snack` (case-insensitive substring). Computed up front as `is_meal_photo` so the confirmation filter below doesn't swallow a `[meal]`-prefixed caption. Anything else with an image is ignored.
 
-When triggered, for each image:
-1. Resolve the cached file at `~/.local/share/signal-cli/attachments/{id}` (signal-cli stores incoming attachments there). No copy made.
-2. Call `estimate_calories(path, body)` — Claude Haiku vision, with the body passed as caption. Returns itemized text.
-3. Send the result back via `send_alert` (Summertime socket → alert recipient), prefixed with `[meal]`. On failure: `[meal] couldn't estimate`.
+When triggered, each image's cached file is resolved at `~/.local/share/signal-cli/attachments/{id}` (signal-cli stores incoming attachments there), then routed by time of day:
 
-No vault writes, no DB inserts, no monthly log. The `messages` row is still inserted into `capture.db` (every Signal message is recorded), but the image itself isn't touched beyond the model call.
+- **Before 8:30 PM** — `queue_meal` copies the photo into `CLAUDE/Running/Meals/` and inserts an entry into capture.db `meal_pending`; the user gets a `[meal] received` acknowledgment (or `[error] meal photo couldn't be queued`). Estimation is deferred so the day's meals are judged in one nightly batch.
+- **At/after 8:30 PM** — estimated immediately: `estimate_calories(path, body)` (Claude Haiku vision, body passed as caption; gluten-free aware — never labels food as wheat/rye/barley, the user is celiac; returns `{items, total, protein_g, carbs_g, fat_g}`), then `log_meal(...)` persists a row to running.db `meal_log` (date, meal_type, items, calories, protein_g, carbs_g, fat_g, image_name) and copies the photo into `Meals/`. `meal_type` comes from a meal word in the caption, else inferred by clock time. Then `mirror_food_to_minutely(date)` upserts the day's totals (kcal + macros) into minutely's `food_days`. The breakdown goes back via `send_alert`, prefixed with `[meal]` and a `P __g · C __g · F __g` macro line.
 
-The confirmation filter at `daemon.py:369` skips `[meal]` and `[photo]` so the daemon doesn't loop on its own replies.
+**Batch processing:** the daemon's `_meal_batch_processor` thread polls every 60s (a single long sleep stalls while the Mac sleeps — Tuesday's batch once fired 4h late) and runs `process_pending_meals` when `pending_meals_due()`: past 8:30 PM with anything queued, or immediately for rows queued on a previous day (daemon was down/asleep at their batch time). Each queued meal is estimated and logged with its **queued** date/time (so meal_type and the day's totals stay correct), then removed from the queue. A failed estimate is retried on later passes; after `MAX_ESTIMATE_ATTEMPTS` (3) the row is dropped with a `[meal] couldn't estimate — photo kept as Meals/<name>` alert.
+
+The `messages` row is still inserted into `capture.db` (every Signal message is recorded). Summertime's 9:45 PM summary reads `meal_log` for the day's kcal.
+
+The confirmation filter (`daemon.py`, gated on `not is_meal_photo`) skips `[meal]`/`[photo]`-prefixed messages so the daemon doesn't loop on its own replies — except a `[meal]` caption carrying an image, which is a real meal command.
 
 ### Config (.env)
 - `SIGNAL_ACCOUNT` — your phone number (E.164 format)

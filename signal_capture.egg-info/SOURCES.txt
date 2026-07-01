@@ -2,8 +2,13 @@ README.md
 pyproject.toml
 signal_capture/__init__.py
 signal_capture/capture.py
+signal_capture/cards.py
 signal_capture/cli.py
+signal_capture/daemon.py
 signal_capture/health.py
+signal_capture/meals.py
+signal_capture/running.py
+signal_capture/triage.py
 signal_capture/viewer.py
 signal_capture.egg-info/PKG-INFO
 signal_capture.egg-info/SOURCES.txt
